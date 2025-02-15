@@ -5,15 +5,15 @@
 include Makevars.mk
 
 
-SRC = $(wildcard lib/*.c)
-OBJ = $(patsubst %, $(BUILD_DIR)/%, $(SRC:.c=.o))
+SRC = $(wildcard lib/*.cpp)
+OBJ = $(patsubst %, $(BUILD_DIR)/%, $(SRC:.cpp=.o))
 BUILD_BIN_FILE = $(BUILD_DIR)/$(BIN_FILE)
 
 
 # compile the object files
 $(OBJ): $(SRC)
 	@mkdir -p $(dir $@)
-	@$(CC) -c $(CFLAGS) -o $@ $(LIBS) $(patsubst $(BUILD_DIR)/%.o, %.c, $@)
+	@$(CC) -c $(CFLAGS) -o $@ $(LIBS) $(patsubst $(BUILD_DIR)/%.o, %.cpp, $@)
 
 
 # build the binary file
@@ -23,12 +23,12 @@ $(BUILD_BIN_FILE): $(OBJ)
 
 # instal the build
 instal: $(BUILD_BIN_FILE)
-	@mkdir -p $(PREFIX)/bin $(MAN_DIR) $(SHARES_DIR)
-	@cp $(BUILD_BIN_FILE) $(PREFIX)/bin/
-	@chmod 755 $(PREFIX)/bin/$(BIN_FILE)
-	@chmod u+s $(PREFIX)/bin/$(BIN_FILE)
-	@cp doc/matlock.1 $(MAN_DIR)/man1/
-	@cp LICENCE $(SHARES_DIR)/LICENCE
+	@mkdir -p $(DESTDIR)$(PREFIX)/bin
+	@cp -f $(BUILD_BIN_FILE) $(DESTDIR)$(PREFIX)/bin/
+	@chmod 755 $(DESTDIR)$(PREFIX)/bin/$(BIN_FILE)
+	@chmod u+s $(DESTDIR)$(PREFIX)/bin/$(BIN_FILE)
+	mkdir -p $(DESTDIR)$(MAN_DIR)/man1
+	@cp doc/matlock.1 $(DESTDIR)$(MAN_DIR)/man1/
 	@echo -e "Program installed.\nBinary file at $(PREFIX)/bin/$(BIN_FILE)"
 
 
@@ -39,10 +39,9 @@ install: instal
 # uninstall
 uninstall:
 	@rm -rf \
-		$(PREFIX)/bin/$(BIN_FILE) \
-		$(MAN_DIR)/man1/matlock.1 \
-		$(PREFIX)/etc/$(BIN_FILE) \
-		$(SHARES_DIR)
+		$(DESTDIR)$(PREFIX)/bin/$(BIN_FILE) \
+		$(DESTDIR)$(MAN_DIR)/man1/matlock.1 \
+		$(DESTDIR)$(PREFIX)/etc/$(BIN_FILE)
 	@echo -e "Program uninstalled and related files deleted."
 
 

@@ -1,9 +1,9 @@
 /** matlock - Matrix Lock
  * See LICENCE file for copyright and licence details. */
 
+#ifndef ARG_HPP__
+#define ARG_HPP__
 
-#ifndef ARG_H__
-#define ARG_H__
 
 extern char *argv0;
 
@@ -61,4 +61,4 @@ extern char *argv0;
 
 #define LNGARG()	&argv[0][0]
 
-#endif
+#endif /* ARG_HPP__ */

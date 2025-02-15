@@ -2,15 +2,14 @@
 # See LICENCE file for copyright and licence details.
 
 # matlock version and binary name
-VERSION = 0.0.0
+VERSION = 1.0.0
 BIN_FILE = matlock
 
 # build and installation directories (absolute paths)
 BUILD_DIR = /tmp/$(BIN_FILE)
 RELEASE_DIR = /tmp/$(BIN_FILE)-v$(VERSION)
 PREFIX = /usr/local
-MAN_DIR = /usr/local/share/man
-SHARES_DIR = $(PREFIX)/share/$(BIN_FILE)
+MAN_DIR = $(PREFIX)/share/man
 
 # external libraries
 X11INC = -I /usr/include/X11
@@ -28,7 +27,7 @@ CPPFLAGS = -D _DEFAULT_SOURCE \
 		   -D HAVE_SHADOW_H \
 		   -D NAME=\"$(BIN_FILE)\" \
 		   -D VERSION=\"$(VERSION)\"
-CFLAGS   = -std=c99 \
+CFLAGS   = -std=c++20 \
 		   -pedantic \
 		   -Wall \
 		   -Os \
@@ -38,4 +37,4 @@ CFLAGS   = -std=c99 \
 LDFLAGS = -s ${LIBS}
 
 # compiler and linker
-CC = gcc
+CC = g++
