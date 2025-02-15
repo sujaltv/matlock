@@ -9,6 +9,12 @@ restructuring and revamping.
 
 ## Installation
 
+This package is available through `yay`:
+
+```sh
+yay -S matlock
+```
+
 The binary file is available in
 [Releases](https://gitlab.sujal.tv/tvsujal/matlock/-/releases).
 
