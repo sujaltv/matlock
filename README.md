@@ -1,10 +1,11 @@
 <div align="center">
-    <h1><img src="./doc/logo.png" width="20%"></h1>
+    <h1><img src="./doc/logo.png" width="175px"></h1>
 </div>
 
-**Matlock**, or Matrix Lock, is a screen lock program for X written in C. This
-is a fork of the [original implementation](https://tools.suckless.org/slock/).
-
+**Matlock**, or Matrix Lock, is a screen lock program for X written in C++.
+Initially a fork of the original C implementation
+[`slock`](https://tools.suckless.org/slock/), it has undergone considerable
+restructuring and revamping.
 
 ## Installation
 
@@ -32,15 +33,15 @@ matlock -h
 
 ## Configuration
 
-At present, all configurations can be made in the C header file
-`include/config.h`.
+At present, all configurations can be made in the C++ header file
+`include/config.hpp`.
 
 ## Manual build <a name="manual-build"></a>
 
 ### Requirements
 
 * Tools:
-    * A modern C compiler (such as `gcc`; 14.0.0 or newer)
+    * A modern C++ compiler (such as `g++`; 14.0.0 or newer)
     * `make` (4.4.0 or newer)
 * Libraries:
     * The [X Library](https://www.x.org) (a.k.a.
@@ -78,8 +79,7 @@ By default,
 
 * the build files are created in `/tmp/dwm` and can be changed by setting the
   variable `BUILD_DIR`;
-* the installation directory is `/usr/local` and can be modified by setting the
-  variable `PREFIX`;
+* the installation directory is `/usr/local`;
     * the binary file will be located in `PREFIX/bin`;
     * the user manual will be located in `PREFIX/shares/man/man1`; and
     * the licence file and other files, if any, will be located in
