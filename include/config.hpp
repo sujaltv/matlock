@@ -10,7 +10,7 @@ static const char* user  = "nobody";
 static const char* group = "nobody";
 
 /* background colour */
-static const char *background = "#000000"; // #181C1F
+static const char *background = "#141D1A";
 
 /* change the characters in the raining columns */
 static const bool mutate_chars = true;
@@ -19,7 +19,7 @@ static const bool mutate_chars = true;
 static const char *fontcolour[Matlock::States::NUMSTATES] = {
 	[Matlock::States::INIT] =   "#1cff7b",   /* after initialization */
 	[Matlock::States::INPUT] =  "#28a99e",   /* during input */
-	[Matlock::States::FAILED] = "#bf6336",   /* wrong password */
+	[Matlock::States::FAILED] = "#E28743",   /* wrong password */
 };
 
 /* treat a cleared input like a wrong password (color) */

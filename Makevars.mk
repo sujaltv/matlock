@@ -3,13 +3,15 @@
 
 # matlock version and binary name
 VERSION = 1.0.0
+RELEASE = 5
+ARCH=x86_64
 BIN_FILE = matlock
 
 # build and installation directories (absolute paths)
-BUILD_DIR = /tmp/$(BIN_FILE)
-RELEASE_DIR = /tmp/$(BIN_FILE)-v$(VERSION)
-PREFIX = /usr/local
-MAN_DIR = $(PREFIX)/share/man
+BUILD_DIR = $(TMPDIR)/$(BIN_FILE)
+__RELEASE_FILE = $(BIN_FILE)-v$(VERSION)-$(RELEASE)-$(ARCH)
+__RELEASE_DIR = $(TMPDIR)/$(__RELEASE_FILE)
+PREFIX = /usr
 
 # external libraries
 X11INC = -I /usr/include/X11
@@ -28,7 +30,7 @@ CPPFLAGS = -D _DEFAULT_SOURCE \
 		   -D NAME=\"$(BIN_FILE)\" \
 		   -D VERSION=\"$(VERSION)\"
 CFLAGS   = -std=c++20 \
-		   -pedantic \
+		   -Wno-pedantic \
 		   -Wall \
 		   -Os \
 		   $(INCS) \

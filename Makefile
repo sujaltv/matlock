@@ -23,12 +23,12 @@ $(BUILD_BIN_FILE): $(OBJ)
 
 # instal the build
 instal: $(BUILD_BIN_FILE)
-	@mkdir -p $(DESTDIR)$(PREFIX)/bin
-	@cp -f $(BUILD_BIN_FILE) $(DESTDIR)$(PREFIX)/bin/
-	@chmod 755 $(DESTDIR)$(PREFIX)/bin/$(BIN_FILE)
-	@chmod u+s $(DESTDIR)$(PREFIX)/bin/$(BIN_FILE)
-	mkdir -p $(DESTDIR)$(MAN_DIR)/man1
-	@cp doc/matlock.1 $(DESTDIR)$(MAN_DIR)/man1/
+	@mkdir -p $(PREFIX)/{bin,share/{man/man1,licenses/$(BIN_FILE)}}
+	@cp -f $(BUILD_BIN_FILE) $(PREFIX)/bin/
+	@chmod 755 $(PREFIX)/bin/$(BIN_FILE)
+	@chmod u+s $(PREFIX)/bin/$(BIN_FILE)
+	@cp man/matlock.1.gz $(PREFIX)/share/man/man1
+	@cp LICENCE $(PREFIX)/share/licenses/$(BIN_FILE)/
 	@echo -e "Program installed.\nBinary file at $(PREFIX)/bin/$(BIN_FILE)"
 
 
@@ -39,26 +39,26 @@ install: instal
 # uninstall
 uninstall:
 	@rm -rf \
-		$(DESTDIR)$(PREFIX)/bin/$(BIN_FILE) \
-		$(DESTDIR)$(MAN_DIR)/man1/matlock.1 \
-		$(DESTDIR)$(PREFIX)/etc/$(BIN_FILE)
+		$(PREFIX)/bin/$(BIN_FILE) \
+		$(PREFIX)/share/man/man1/matlock.1.gz \
+		$(PREFIX)/share/licenses/$(BIN_FILE)
 	@echo -e "Program uninstalled and related files deleted."
 
 
 # create a release tarball
-release: $(BUILD_BIN_FILE)
-	@mkdir -p $(RELEASE_DIR)
-	@cp $(BUILD_BIN_FILE) $(RELEASE_DIR)
-	@cp doc/matlock.1 $(RELEASE_DIR)
-	@cp LICENCE $(RELEASE_DIR)
-	@cp README.md $(RELEASE_DIR)
-	@tar czf $(RELEASE_DIR).tar.gz -C $(RELEASE_DIR)/.. $(BIN_FILE)-v$(VERSION)
-	@rm -r $(RELEASE_DIR)
-	@echo -e "Release files created and compressed.\nFile at $(RELEASE_DIR).tar.gz"
+build: $(BUILD_BIN_FILE)
+	@mkdir -p $(__RELEASE_DIR)
+	@cp $(BUILD_BIN_FILE) $(__RELEASE_DIR)
+	@cp man/matlock.1.gz $(__RELEASE_DIR)
+	@cp LICENCE $(__RELEASE_DIR)
+	@cp README.md $(__RELEASE_DIR)
+	@tar czf $(__RELEASE_DIR).tar.gz -C $(__RELEASE_DIR)/.. $(__RELEASE_FILE)
+	@rm -r $(BUILD_DIR) $(__RELEASE_DIR)
+	@echo -e "Release files created and compressed.\nFile at $(__RELEASE_DIR).tar.gz"
 
 
 clean:
-	@rm -rf $(BUILD_DIR)
+	@rm -rf $(BUILD_DIR) $(__RELEASE_DIR).tar.gz
 	@echo -e "Build files removed."
 
 
