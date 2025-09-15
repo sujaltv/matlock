@@ -83,11 +83,11 @@ sudo make uninstall
 
 By default,
 
-* the build files are created in `/tmp/dwm` and can be changed by setting the
+* the build files are created in `$TMPDIR/matlock` and can be changed by setting the
   variable `BUILD_DIR`;
-* the installation directory is `/usr/local`;
+* the installation directory is `PREFIX` (likely `/usr/`);
     * the binary file will be located in `PREFIX/bin`;
-    * the user manual will be located in `PREFIX/shares/man/man1`; and
+    * the user manual will be located in `PREFIX/share/man/man1`; and
     * the licence file and other files, if any, will be located in
-      `PREFIX/shares/matlock`
+      `PREFIX/share/licenses/matlock`
 
