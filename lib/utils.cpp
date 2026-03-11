@@ -4,13 +4,13 @@
 /* $OpenBSD: explicit_bzero.c,v 1.3 2014/06/21 02:34:26 matthew Exp $
  * 'explicit_bzero' originally written by Matthew Dempsky. */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdarg.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdarg>
 #include <unistd.h>
 #include <pwd.h>
-#include <errno.h>
+#include <cerrno>
 #if HAVE_SHADOW_H
     #include <shadow.h>
 #endif
@@ -67,11 +67,15 @@ const char* Utils::get_hash(void) {
 }
 
 
-__attribute__((weak)) void __explicit_bzero_hook(void* buf, size_t len) {}
+int Utils::timingsafe_bcmp(const void* a, const void* b, size_t len) {
+	const volatile unsigned char* p1 = (const volatile unsigned char*) a;
+	const volatile unsigned char* p2 = (const volatile unsigned char*) b;
+	volatile unsigned char result = 0;
 
-void explicit_bzero(void* buf, size_t len) {
-	memset(buf, 0, len);
-	__explicit_bzero_hook(buf, len);
+	for (size_t i = 0; i < len; i++)
+		result |= p1[i] ^ p2[i];
+
+	return result != 0;
 }
 
 
@@ -79,7 +83,7 @@ void explicit_bzero(void* buf, size_t len) {
     #include <fcntl.h>
     #include <linux/oom.h>
     #include <cstdio>
-    #include <errno.h>
+    #include <cerrno>
 
     void dont_kill_me() {
     	FILE* f;

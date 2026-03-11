@@ -6,11 +6,13 @@
     #define NAME "matlock"
 #endif
 
-#include <errno.h>
+#include <cerrno>
 #include <grp.h>
 #include <pwd.h>
-#include <stdio.h>
-#include <string.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <unistd.h>
 
 #include "../include/arg.hpp"
@@ -61,6 +63,7 @@ const char* get_user_hash() {
 
 
 int main(int argc, char* argv[]) {
+    srand(time(NULL) ^ getpid());
     Matlock m;
 	const char *hash;
 	errno = 0;

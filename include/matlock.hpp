@@ -6,12 +6,17 @@
 
 /* The Matrix-like rain-related constants */
 #define MAX_DROPLETS 1000
+#define NUM_THREADS_PER_FRAME 2
 #define DROPLET_LENGTH 50
 #define MATRIX_CHARS "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789~`!@#$%^&*()_+-=[]{}\\;:'\",<.>/?"
 #define NUM_MATRIX_CHARS 69
 #define UPDATE_INTERVAL 10042
+#define DEPTH_LEVELS 4
 
+#include <cstdint>
 #include <X11/Xlib.h>
+#include <vector>
+#include <memory>
 
 
 /* forward declaration */
@@ -19,28 +24,34 @@ struct Monitor;
 
 
 struct Droplet {
+    int active;                         // Whether this stream is currently active
+    int depth;                          // Depth level (0 = closest, DEPTH_LEVELS-1 = farthest)
     int x;                              // x position
     int y;                              // y position
     int speed;                          // How many pixels to move per update
-    char chars[DROPLET_LENGTH];         // Characters in this stream
     int length;                         // Actual length of this stream
-    int active;                         // Whether this stream is currently active
+    char chars[DROPLET_LENGTH];         // Characters in this stream (cold, accessed only during draw)
 };
 
 
 struct Rain {
     public:
         struct Droplet droplets[MAX_DROPLETS];
-        XFontStruct* font;
-        int char_width;
-        int char_height;
-        GC gc;
-        unsigned long default_colour;       // Main green color
-        unsigned long default_head_colour;  // Bright head color
-        unsigned long input_colour;         // Blue color for typing
-        unsigned long input_head_colour;    // Bright blue for typing head
-        unsigned long failed_colour;        // Red color for failed
-        unsigned long failed_head_colour;   // Bright red for failed head
+        int active_list[MAX_DROPLETS];      // Indices of active droplets
+        int active_count;                   // Number of active droplets
+        int free_head;                      // Head of free-list (-1 = empty)
+        uint32_t rng_state;                 // xorshift32 PRNG state
+        XFontStruct* font[DEPTH_LEVELS];
+        int char_width[DEPTH_LEVELS];
+        int char_height[DEPTH_LEVELS];
+        GC gc[DEPTH_LEVELS];
+        Pixmap backbuffer;
+        unsigned long default_colour[DEPTH_LEVELS];
+        unsigned long default_head_colour[DEPTH_LEVELS];
+        unsigned long input_colour[DEPTH_LEVELS];
+        unsigned long input_head_colour[DEPTH_LEVELS];
+        unsigned long failed_colour[DEPTH_LEVELS];
+        unsigned long failed_head_colour[DEPTH_LEVELS];
 
         void rain_droplet(int, int);
 };
@@ -72,7 +83,7 @@ class Matlock {
         int num_screens;
 
         /* attached monitors */
-        struct Monitor** monitors;
+        std::vector<std::unique_ptr<Monitor>> monitors;
 
         /* XRandr base codes */
         struct XRRBaseCodes rr;
@@ -92,7 +103,7 @@ class Matlock {
         int lock_screens(const char*);
 
     private:
-        struct Monitor* lock_screen(int, const char*);
+        std::unique_ptr<Monitor> lock_screen(int, const char*);
 };
 
 
@@ -121,6 +132,9 @@ struct Monitor {
 
         /* keep raining */
         void keep_raining(Display*, int, bool);
+
+        /* free X11 resources */
+        void cleanup(Display*);
 };
 
 

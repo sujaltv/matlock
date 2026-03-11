@@ -1,10 +1,14 @@
-#include <stdlib.h>
-#include <errno.h>
-#include <ctype.h>
-#include <stdio.h>
+#include <cstdlib>
+#include <cstdint>
+#include <cerrno>
+#include <cctype>
+#include <cstdio>
+#include <cmath>
+#include <algorithm>
 #include <unistd.h>
-#include <string.h>
+#include <cstring>
 #include <sys/time.h>
+#include <sys/select.h>
 #include <X11/extensions/Xrandr.h>
 
 #include "../include/matlock.hpp"
@@ -22,12 +26,6 @@ Matlock::Matlock() {
     /* set the number of attached screens */
     this->num_screens = ScreenCount(this->disp);
 
-    /* allocate memory for the monitors */
-    this->monitors = (struct Monitor**) calloc(this->num_screens, sizeof(struct Monitor*));
-    if (!this->monitors) {
-        Utils::die("%s: out of memory\n", NAME);
-    }
-
     this->rr.active = XRRQueryExtension(this->disp, &this->rr.event, &this->rr.error);
 }
 
@@ -37,7 +35,9 @@ Matlock::~Matlock() {
      * Cleanup allocated memories and close the display server.
      */
 
-    free(this->monitors);
+    for (auto& mon : this->monitors)
+        mon->cleanup(this->disp);
+    this->monitors.clear();
     XCloseDisplay(this->disp);
 }
 
@@ -59,17 +59,19 @@ void Matlock::read_pwd(const char* hash, bool mutate_chars, int failonclear, con
     unsigned int oldc = Matlock::States::INIT;  // Make oldc accessible to update_matrix_effect
 
     // Initialize matrix effect for each screen
-    for (int screen = 0; screen < this->num_screens; screen++) {
-        this->monitors[screen]->init_rain(this->disp, fontcolour);
+    for (auto& mon : this->monitors) {
+        mon->init_rain(this->disp, fontcolour);
     }
 
     gettimeofday(&last_update, NULL);
 	XRRScreenChangeNotifyEvent* rre;
 	char buf[32], passwd[256], *inputhash;
-	int num, screen, running, failure;
+	int num, running, failure;
 	unsigned int len, colour;
 	KeySym ksym;
 	XEvent ev;
+	int xfd = ConnectionNumber(this->disp);
+	fd_set fds;
 
 	len = 0;
 	running = 1;
@@ -77,7 +79,7 @@ void Matlock::read_pwd(const char* hash, bool mutate_chars, int failonclear, con
 	oldc = Matlock::States::INIT;
 
 	while (running) {
-        // Check for X events
+        // Process all pending X events
         while (XPending(this->disp)) {
             XNextEvent(this->disp, &ev);
 		if (ev.type == KeyPress) {
@@ -101,8 +103,11 @@ void Matlock::read_pwd(const char* hash, bool mutate_chars, int failonclear, con
 				errno = 0;
 				if (!(inputhash = crypt(passwd, hash)))
 					fprintf(stderr, "%s: crypt: %s\n", NAME, strerror(errno));
-				else
-					running = !!strcmp(inputhash, hash);
+				else {
+					size_t hlen = strlen(hash);
+					running = strlen(inputhash) != hlen ||
+					          Utils::timingsafe_bcmp(inputhash, hash, hlen);
+				}
 				if (running) {
 					XBell(this->disp, 100);
 					failure = 1;
@@ -129,60 +134,68 @@ void Matlock::read_pwd(const char* hash, bool mutate_chars, int failonclear, con
 			}
 			colour = len ? Matlock::States::INPUT : ((failure || failonclear) ? Matlock::States::FAILED : Matlock::States::INIT);
 			if (running && oldc != colour) {
-				for (screen = 0; screen < this->num_screens; screen++) {
-					XSetWindowBackground(this->disp, this->monitors[screen]->win, this->monitors[screen]->colours[colour]);
-					XClearWindow(this->disp, this->monitors[screen]->win);
+				for (auto& mon : this->monitors) {
+					XSetWindowBackground(this->disp, mon->win, mon->colours[colour]);
+					XClearWindow(this->disp, mon->win);
 				}
 				oldc = colour;
 			}
 		} else if (this->rr.active && ev.type == this->rr.event + RRScreenChangeNotify) {
 			rre = (XRRScreenChangeNotifyEvent*)&ev;
-			for (screen = 0; screen < this->num_screens; screen++) {
-				if (this->monitors[screen]->win == rre->window) {
+			for (auto& mon : this->monitors) {
+				if (mon->win == rre->window) {
 					if (rre->rotation == RR_Rotate_90 ||
 					    rre->rotation == RR_Rotate_270)
-						XResizeWindow(this->disp, this->monitors[screen]->win,
+						XResizeWindow(this->disp, mon->win,
 						              rre->height, rre->width);
 					else
-						XResizeWindow(this->disp, this->monitors[screen]->win,
+						XResizeWindow(this->disp, mon->win,
 						              rre->width, rre->height);
-					XClearWindow(this->disp, this->monitors[screen]->win);
+					XClearWindow(this->disp, mon->win);
 					break;
 				}
 			}
 		} else {
-			for (screen = 0; screen < this->num_screens; screen++)
-				XRaiseWindow(this->disp, this->monitors[screen]->win);
+			for (auto& mon : this->monitors)
+				XRaiseWindow(this->disp, mon->win);
 		}
 	}
-	
-	// Update matrix effect
+
+	// Calculate time until next frame
 	gettimeofday(&current_time, NULL);
 	long elapsed = (current_time.tv_sec - last_update.tv_sec) * 1000000 +
 	              (current_time.tv_usec - last_update.tv_usec);
 
 	if (elapsed >= UPDATE_INTERVAL) {
-	    for (int screen = 0; screen < this->num_screens; screen++) {
-	        this->monitors[screen]->keep_raining(this->disp, oldc, mutate_chars);
+	    for (auto& mon : this->monitors) {
+	        mon->keep_raining(this->disp, oldc, mutate_chars);
 	    }
 	    last_update = current_time;
 	} else {
-	    usleep(1000); // Small sleep to prevent CPU hogging
+	    // Wait for X events or next frame timeout via select()
+	    long wait_us = UPDATE_INTERVAL - elapsed;
+	    struct timeval timeout;
+	    timeout.tv_sec = wait_us / 1000000;
+	    timeout.tv_usec = wait_us % 1000000;
+	    FD_ZERO(&fds);
+	    FD_SET(xfd, &fds);
+	    select(xfd + 1, &fds, NULL, NULL, &timeout);
 	}
 	}
 }
 
 
-struct Monitor* Matlock::lock_screen(int screen_num, const char* background_colour) {
+std::unique_ptr<Monitor> Matlock::lock_screen(int screen_num, const char* background_colour) {
 	char curs[] = {0, 0, 0, 0, 0, 0, 0, 0};
 	int i, ptgrab, kbgrab;
-	struct Monitor* lock;
 	XColor colour, dummy;
 	XSetWindowAttributes wa;
 	Cursor invisible;
 
-	if (this->disp == NULL || screen_num < 0 || !(lock = (struct Monitor*) malloc(sizeof(struct Monitor))))
-		return NULL;
+	if (this->disp == NULL || screen_num < 0)
+		return nullptr;
+
+	auto lock = std::make_unique<Monitor>();
 
 	lock->screen_num = screen_num;
 	lock->parent = RootWindow(this->disp, lock->screen_num);
@@ -243,23 +256,72 @@ struct Monitor* Matlock::lock_screen(int screen_num, const char* background_colo
 		fprintf(stderr, "%s: unable to grab mouse pointer for screen %d\n", NAME, screen_num);
 	if (kbgrab != GrabSuccess)
 		fprintf(stderr, "%s: unable to grab keyboard for screen %d\n", NAME, screen_num);
-	return NULL;
+	return nullptr;
 }
 
 
 int Matlock::lock_screens(const char* background_colour) {
-    int n_locks, s;
-
-	for (n_locks = 0, s = 0; s < this->num_screens; s++) {
-		if ((this->monitors[s] = this->lock_screen(s, background_colour)) != NULL)
-			n_locks++;
+	for (int s = 0; s < this->num_screens; s++) {
+		auto mon = this->lock_screen(s, background_colour);
+		if (mon)
+			this->monitors.push_back(std::move(mon));
 		else
 			break;
 	}
 
 	XSync(this->disp, 0);
 
-    return n_locks;
+    return static_cast<int>(this->monitors.size());
+}
+
+
+void Monitor::cleanup(Display* disp) {
+    for (int d = 0; d < DEPTH_LEVELS; d++) {
+        if (this->rain.font[d]) {
+            XFreeFont(disp, this->rain.font[d]);
+            this->rain.font[d] = nullptr;
+        }
+        if (this->rain.gc[d]) {
+            XFreeGC(disp, this->rain.gc[d]);
+            this->rain.gc[d] = 0;
+        }
+    }
+    if (this->rain.backbuffer) {
+        XFreePixmap(disp, this->rain.backbuffer);
+        this->rain.backbuffer = 0;
+    }
+    if (this->pixmap) {
+        XFreePixmap(disp, this->pixmap);
+        this->pixmap = 0;
+    }
+}
+
+
+static unsigned long alloc_dimmed_colour(Display* disp, int screen,
+        const char* hex, float alpha) {
+    /**
+     * Parse a "#RRGGBB" hex string, scale RGB by alpha, and allocate an X11
+     * colour. On a black background, colour * alpha is equivalent to true
+     * alpha blending.
+     */
+    unsigned int r, g, b;
+    sscanf(hex + 1, "%02x%02x%02x", &r, &g, &b);
+
+    XColor xc;
+    xc.red   = (unsigned short)(r * alpha) * 257;
+    xc.green = (unsigned short)(g * alpha) * 257;
+    xc.blue  = (unsigned short)(b * alpha) * 257;
+    xc.flags = DoRed | DoGreen | DoBlue;
+
+    XAllocColor(disp, DefaultColormap(disp, screen), &xc);
+    return xc.pixel;
+}
+
+
+static const float depth_alpha[DEPTH_LEVELS] = {1.0f, 0.65f, 0.4f, 0.2f};
+
+static inline uint32_t fast_rand(uint32_t& s) {
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5; return s;
 }
 
 
@@ -270,36 +332,54 @@ void Monitor::init_rain(Display* disp, const char* font_colour[]) {
      */
 
     XGCValues gcv;
-    XColor colour, buffer;
 
-    this->rain.font = XLoadQueryFont(disp, "9x13");
-    if (!this->rain.font) {
-        this->rain.font = XLoadQueryFont(disp, "6x13");
+    // Font pixel sizes per depth: closer = larger, farther = smaller
+    static const int depth_font_size[DEPTH_LEVELS] = {20, 16, 13, 10};
+    char font_name[128];
+
+    for (int d = 0; d < DEPTH_LEVELS; d++) {
+        snprintf(font_name, sizeof(font_name),
+            "-misc-fixed-medium-r-semicondensed--%d-*-*-*-c-*-iso8859-1",
+            depth_font_size[d]);
+        this->rain.font[d] = XLoadQueryFont(disp, font_name);
+        if (!this->rain.font[d])
+            this->rain.font[d] = XLoadQueryFont(disp, "6x13");
+        if (!this->rain.font[d])
+            Utils::die("matlock: no usable font found\n");
+
+        this->rain.char_width[d] = this->rain.font[d]->max_bounds.width;
+        this->rain.char_height[d] = this->rain.font[d]->ascent + this->rain.font[d]->descent;
+
+        gcv.font = this->rain.font[d]->fid;
+        this->rain.gc[d] = XCreateGC(disp, this->win, GCFont, &gcv);
     }
 
-    this->rain.char_width = this->rain.font->max_bounds.width;
-    this->rain.char_height = this->rain.font->ascent + this->rain.font->descent;
+    // Create backbuffer for double-buffering
+    int width = DisplayWidth(disp, this->screen_num);
+    int height = DisplayHeight(disp, this->screen_num);
+    int depth = DefaultDepth(disp, this->screen_num);
+    this->rain.backbuffer = XCreatePixmap(disp, this->win, width, height, depth);
 
-    gcv.font = this->rain.font->fid;
-    this->rain.gc = XCreateGC(disp, this->win, GCFont, &gcv);
+    /* allocate depth-dimmed colour variants for each state */
+    for (int d = 0; d < DEPTH_LEVELS; d++) {
+        float a = depth_alpha[d];
+        float ha = std::min(1.0f, a * 1.3f);
 
-    auto assign_colour = [&](unsigned long* dest, const char* fc) {
-        XAllocNamedColor(disp, DefaultColormap(disp, this->screen_num), fc,
-                &colour, &buffer);
-        *dest = colour.pixel;
-    };
+        this->rain.default_colour[d]      = alloc_dimmed_colour(disp, this->screen_num, font_colour[Matlock::States::INIT], a);
+        this->rain.default_head_colour[d]  = alloc_dimmed_colour(disp, this->screen_num, font_colour[Matlock::States::INIT], ha);
+        this->rain.input_colour[d]         = alloc_dimmed_colour(disp, this->screen_num, font_colour[Matlock::States::INPUT], a);
+        this->rain.input_head_colour[d]    = alloc_dimmed_colour(disp, this->screen_num, font_colour[Matlock::States::INPUT], ha);
+        this->rain.failed_colour[d]        = alloc_dimmed_colour(disp, this->screen_num, font_colour[Matlock::States::FAILED], a);
+        this->rain.failed_head_colour[d]   = alloc_dimmed_colour(disp, this->screen_num, font_colour[Matlock::States::FAILED], ha);
+    }
 
-    /* character and the head character colours */
-    assign_colour(&this->rain.default_colour, font_colour[Matlock::States::INIT]);
-    assign_colour(&this->rain.default_head_colour, font_colour[Matlock::States::INIT]);
-    assign_colour(&this->rain.input_colour, font_colour[Matlock::States::INPUT]);
-    assign_colour(&this->rain.input_head_colour, font_colour[Matlock::States::INPUT]);
-    assign_colour(&this->rain.failed_colour, font_colour[Matlock::States::FAILED]);
-    assign_colour(&this->rain.failed_head_colour, font_colour[Matlock::States::FAILED]);
-
-    // initialise droplets
+    // initialise droplets as a free-list
+    this->rain.free_head = 0;
+    this->rain.active_count = 0;
+    this->rain.rng_state = (uint32_t)rand() | 1; // must be non-zero
     for (int i = 0; i < MAX_DROPLETS; i++) {
         this->rain.droplets[i].active = 0;
+        this->rain.droplets[i].x = (i + 1 < MAX_DROPLETS) ? i + 1 : -1;
     }
 }
 
@@ -307,69 +387,105 @@ void Monitor::init_rain(Display* disp, const char* font_colour[]) {
 void Monitor::keep_raining(Display* disp, int current_state, bool mutate_chars) {
     int width = DisplayWidth(disp, this->screen_num);
     int height = DisplayHeight(disp, this->screen_num);
+    Pixmap dst = this->rain.backbuffer;
 
-    // Clear the window
-    XSetForeground(disp, this->rain.gc, this->colours[Matlock::States::INIT]);
-    XFillRectangle(disp, this->win, this->rain.gc, 0, 0, width, height);
+    // Clear the backbuffer (use gc[0] for non-text operations)
+    XSetForeground(disp, this->rain.gc[0], this->colours[Matlock::States::INIT]);
+    XFillRectangle(disp, dst, this->rain.gc[0], 0, 0, width, height);
 
-    // Randomly create new droplets
-    if (rand() % 7 == 0) {
-        this->rain.rain_droplet(width, height);
+    // Randomly create new droplets (spawn up to 2 per frame)
+    for (int s = 0; s < NUM_THREADS_PER_FRAME; s++) {
+        if (fast_rand(this->rain.rng_state) % 5 == 0)
+            this->rain.rain_droplet(width, height);
     }
 
-    // Update and draw each droplet
-    for (int i = 0; i < MAX_DROPLETS; i++) {
-        if (this->rain.droplets[i].active) {
-            // Draw the droplet
-            for (int j = 0; j < this->rain.droplets[i].length; j++) {
-                int y = this->rain.droplets[i].y - (j * this->rain.char_height);
+    // Select colour arrays based on state
+    unsigned long* body_colour;
+    unsigned long* head_colour;
+    if (current_state == Matlock::States::INPUT) {
+        body_colour = this->rain.input_colour;
+        head_colour = this->rain.input_head_colour;
+    } else if (current_state == Matlock::States::FAILED) {
+        body_colour = this->rain.failed_colour;
+        head_colour = this->rain.failed_head_colour;
+    } else {
+        body_colour = this->rain.default_colour;
+        head_colour = this->rain.default_head_colour;
+    }
 
-                if (y < 0) continue;
-                if (y > height) continue;
+    // Pass 1: Update positions, mutate chars, deactivate off-screen droplets
+    for (int ai = 0; ai < this->rain.active_count; ai++) {
+        int i = this->rain.active_list[ai];
+        struct Droplet& drop = this->rain.droplets[i];
+        int dch = this->rain.char_height[drop.depth];
 
-                // Only deactivate droplet when the top character (last in the droplet) passes bottom
-                if (j == this->rain.droplets[i].length - 1 && y > height) {
-                    this->rain.droplets[i].active = 0;
-                    break;
+        // Deactivate if the tail (topmost char) has scrolled past the bottom
+        int tail_y = drop.y - ((drop.length - 1) * dch);
+        if (tail_y > height) {
+            drop.active = 0;
+            drop.x = this->rain.free_head;
+            this->rain.free_head = i;
+            // Swap-remove from active list
+            this->rain.active_list[ai] = this->rain.active_list[--this->rain.active_count];
+            ai--;
+            continue;
+        }
+
+        // Mutate characters
+        if (mutate_chars) {
+            uint32_t rnd = fast_rand(this->rain.rng_state);
+            int bits_left = 6;
+            for (int j = 0; j < drop.length; j++) {
+                if ((rnd & 0x1F) < 2) {
+                    drop.chars[j] = MATRIX_CHARS[fast_rand(this->rain.rng_state) % NUM_MATRIX_CHARS];
                 }
-
-                // Choose colours based on current state
-                if (current_state == Matlock::States::INPUT) {
-                    if (j == 0) {
-                        XSetForeground(disp, this->rain.gc, this->rain.input_head_colour);
-                    } else {
-                        XSetForeground(disp, this->rain.gc, this->rain.input_colour);
-                    }
-                } else if (current_state == Matlock::States::FAILED) {
-                    if (j == 0) {
-                        XSetForeground(disp, this->rain.gc, this->rain.failed_head_colour);
-                    } else {
-                        XSetForeground(disp, this->rain.gc, this->rain.failed_colour);
-                    }
-                } else {
-                    if (j == 0) {
-                        XSetForeground(disp, this->rain.gc, this->rain.default_head_colour);
-                    } else {
-                        XSetForeground(disp, this->rain.gc, this->rain.default_colour);
-                    }
-                }
-
-                char str[2] = {this->rain.droplets[i].chars[j], '\0'};
-                XDrawString(disp, this->win, this->rain.gc, this->rain.droplets[i].x, y, str, 1);
-
-                if (mutate_chars) {
-                    // Randomly change characters inside a droplet
-                    if (rand() % 20 == 0) {
-                        this->rain.droplets[i].chars[j] = MATRIX_CHARS[rand() % NUM_MATRIX_CHARS];
-                    }
+                rnd >>= 5;
+                if (--bits_left <= 0) {
+                    rnd = fast_rand(this->rain.rng_state);
+                    bits_left = 6;
                 }
             }
+        }
 
-            // Move the droplet down
-            this->rain.droplets[i].y += this->rain.droplets[i].speed;
+        // Move the droplet down
+        drop.y += drop.speed;
+    }
+
+    // Pass 2: Draw grouped by depth — only 8 XSetForeground calls total
+    for (int d = 0; d < DEPTH_LEVELS; d++) {
+        GC dgc = this->rain.gc[d];
+        int dch = this->rain.char_height[d];
+
+        // Body pass
+        XSetForeground(disp, dgc, body_colour[d]);
+        for (int ai = 0; ai < this->rain.active_count; ai++) {
+            int i = this->rain.active_list[ai];
+            struct Droplet& drop = this->rain.droplets[i];
+            if (drop.depth != d) continue;
+
+            for (int j = 1; j < drop.length; j++) {
+                int y = drop.y - (j * dch);
+                if (y < 0 || y > height) continue;
+                XDrawString(disp, dst, dgc, drop.x, y, &drop.chars[j], 1);
+            }
+        }
+
+        // Head pass
+        XSetForeground(disp, dgc, head_colour[d]);
+        for (int ai = 0; ai < this->rain.active_count; ai++) {
+            int i = this->rain.active_list[ai];
+            struct Droplet& drop = this->rain.droplets[i];
+            if (drop.depth != d) continue;
+
+            int y = drop.y;
+            if (y >= 0 && y <= height) {
+                XDrawString(disp, dst, dgc, drop.x, y, &drop.chars[0], 1);
+            }
         }
     }
 
+    // Flip backbuffer to window
+    XCopyArea(disp, dst, this->win, this->rain.gc[0], 0, 0, width, height, 0, 0);
     XFlush(disp);
 }
 
@@ -379,43 +495,45 @@ void Rain::rain_droplet(int width, int height) {
      * Create a droplet (a stream of characters) and rain it down the screen.
      */
 
-    // First try to find an inactive droplet
-    for (int i = 0; i < MAX_DROPLETS; i++) {
-        if (!this->droplets[i].active) {
-            this->droplets[i].x = rand() % width;
-            this->droplets[i].y = 0;
-            this->droplets[i].speed = 1 + (rand() % 3);
-            this->droplets[i].length = DROPLET_LENGTH - (rand() % (DROPLET_LENGTH/2));
-            this->droplets[i].active = 1;
+    if (width <= 0 || height <= 0) return;
 
-            // Fill with random characters
-            for (int j = 0; j < this->droplets[i].length; j++) {
-                this->droplets[i].chars[j] = MATRIX_CHARS[rand() % NUM_MATRIX_CHARS];
-            }
-            return;
+    int idx;
+
+    if (this->free_head >= 0) {
+        // O(1) allocation from free-list
+        idx = this->free_head;
+        this->free_head = this->droplets[idx].x; // next-free stored in x
+    } else {
+        // Fallback: recycle the furthest-down droplet from active list
+        if (this->active_count == 0) return;
+        int worst_ai = 0;
+        int max_y = this->droplets[this->active_list[0]].y;
+        for (int ai = 1; ai < this->active_count; ai++) {
+            int y = this->droplets[this->active_list[ai]].y;
+            if (y > max_y) { max_y = y; worst_ai = ai; }
         }
+        idx = this->active_list[worst_ai];
+        // Swap-remove recycled entry from active list
+        this->active_list[worst_ai] = this->active_list[--this->active_count];
     }
 
-    // If no inactive droplet found, find the one that's furthest down and recycle it
-    int furthest_droplet = 0;
-    int max_y = this->droplets[0].y;
-
-    for (int i = 1; i < MAX_DROPLETS; i++) {
-        if (this->droplets[i].y > max_y) {
-            max_y = this->droplets[i].y;
-            furthest_droplet = i;
-        }
+    this->droplets[idx].x = fast_rand(this->rng_state) % width;
+    this->droplets[idx].y = 0;
+    this->droplets[idx].depth = fast_rand(this->rng_state) % DEPTH_LEVELS;
+    switch (this->droplets[idx].depth) {
+        case 0: this->droplets[idx].speed = 5 + (fast_rand(this->rng_state) % 2); break;
+        case 1: this->droplets[idx].speed = 3 + (fast_rand(this->rng_state) % 2); break;
+        case 2: this->droplets[idx].speed = 2 + (fast_rand(this->rng_state) % 2); break;
+        case 3: this->droplets[idx].speed = 1;                                     break;
     }
+    // Closer droplets are longer, farther ones shorter
+    static const float depth_length_scale[DEPTH_LEVELS] = {1.0f, 0.7f, 0.45f, 0.25f};
+    int max_len = (int)(DROPLET_LENGTH * depth_length_scale[this->droplets[idx].depth]);
+    this->droplets[idx].length = max_len - (fast_rand(this->rng_state) % (max_len / 2 + 1));
+    this->droplets[idx].active = 1;
+    this->active_list[this->active_count++] = idx;
 
-    // Recycle the furthest droplet
-    this->droplets[furthest_droplet].x = rand() % width;
-    this->droplets[furthest_droplet].y = 0;
-    this->droplets[furthest_droplet].speed = 1 + (rand() % 3);
-    this->droplets[furthest_droplet].length = DROPLET_LENGTH - (rand() % (DROPLET_LENGTH/2));
-    this->droplets[furthest_droplet].active = 1;
-
-    // Fill with new random characters
-    for (int j = 0; j < this->droplets[furthest_droplet].length; j++) {
-        this->droplets[furthest_droplet].chars[j] = MATRIX_CHARS[rand() % NUM_MATRIX_CHARS];
+    for (int j = 0; j < this->droplets[idx].length; j++) {
+        this->droplets[idx].chars[j] = MATRIX_CHARS[fast_rand(this->rng_state) % NUM_MATRIX_CHARS];
     }
 }

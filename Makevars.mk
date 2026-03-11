@@ -2,8 +2,8 @@
 # See LICENCE file for copyright and licence details.
 
 # matlock version and binary name
-VERSION = 1.0.0
-RELEASE = 5
+VERSION = 1.1.0
+RELEASE = 0
 ARCH=x86_64
 BIN_FILE = matlock
 
@@ -32,7 +32,7 @@ CPPFLAGS = -D _DEFAULT_SOURCE \
 CFLAGS   = -std=c++20 \
 		   -Wno-pedantic \
 		   -Wall \
-		   -Os \
+		   -O2 -flto \
 		   $(INCS) \
 		   $(CPPFLAGS)
 
