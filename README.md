@@ -2,10 +2,17 @@
     <h1><img src="./doc/logo.png" width="175px"></h1>
 </div>
 
-**Matlock**, or Matrix Lock, is a screen lock program for X written in C++.
-Initially a fork of the original C implementation
+**Matlock**, or Matrix Lock, is a screen lock program for X and Wayland
+written in C++. Initially a fork of the original C implementation
 [`slock`](https://tools.suckless.org/slock/), it has undergone considerable
 restructuring and revamping.
+
+The backend is chosen at runtime: under a Wayland session (`WAYLAND_DISPLAY`
+set), the session is locked through the
+[`ext-session-lock-v1`](https://wayland.app/protocols/ext-session-lock-v1)
+protocol, supported by niri, sway, river, Hyprland, KWin and other
+wlroots-based compositors (GNOME/Mutter does not implement it); otherwise the
+X11 backend is used (`DISPLAY` set).
 
 ## Installation
 
@@ -39,8 +46,29 @@ matlock -h
 
 ## Configuration
 
-At present, all configurations can be made in the C++ header file
-`include/config.hpp`.
+Matlock reads `/etc/matlock.yaml` and then per-user overrides from
+`$XDG_CONFIG_HOME/matlock/matlock.yaml` (usually
+`~/.config/matlock/matlock.yaml`). Both files are watched while the screen
+is locked and changes apply live. Only a flat `key: value` YAML subset is
+supported; see the installed `/etc/matlock.yaml` for a commented example.
+
+```
+Key           Default      Purpose
+------------  -----------  -----------------------------------------
+background    "#141D1A"    background colour
+font_pattern  monospace    fontconfig pattern for the rain glyphs
+                           (Wayland only; X11 uses core fonts)
+font_size     20           pixel size of the closest rain layer
+                           (10..128); farther layers interpolate
+                           linearly down to 10
+mutate_chars  true         characters in falling columns mutate
+failonclear   false        treat cleared input as failed (colour)
+fontcolour    init/input/  rain colours per state ("#RRGGBB")
+              failed
+```
+
+The user and group privileges are dropped to remain compile-time settings
+in `include/config.hpp`.
 
 ## Manual build <a name="manual-build"></a>
 
@@ -55,6 +83,13 @@ At present, all configurations can be made in the C++ header file
       or `libX11`), pointed to by the `Make` variables `X11INC` and `X11LIB`
     * [libcrypt](https://github.com/besser82/libxcrypt/), pointed to by the
       `Make` variable `CRYPTLIB`
+    * For the Wayland backend (`Make` variables `WLINC` and `WLLIB`):
+      [`wayland-client`](https://wayland.freedesktop.org),
+      [`wayland-protocols`](https://gitlab.freedesktop.org/wayland/wayland-protocols)
+      and `wayland-scanner` (build-time),
+      [`libxkbcommon`](https://xkbcommon.org),
+      [FreeType](https://freetype.org) and
+      [Fontconfig](https://www.freedesktop.org/wiki/Software/fontconfig/)
 
 ### Compilation
 

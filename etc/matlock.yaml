@@ -1,0 +1,32 @@
+---
+# matlock configuration
+#
+# These are the system-wide defaults; per-user overrides go in
+# $XDG_CONFIG_HOME/matlock/matlock.yaml (usually ~/.config/matlock/matlock.yaml).
+# Changes to either file are applied live, even while the screen is locked.
+#
+# Only the flat "key: value" form shown here is supported.
+
+# background colour ("#RRGGBB")
+background: "#141D1A"
+
+# fontconfig pattern for the rain glyphs (Wayland backend only; the X11
+# backend uses core bitmap fonts)
+font_pattern: monospace
+
+# pixel size of the closest rain layer (10..128); the farther layers
+# interpolate linearly down to 10
+font_size: 20
+
+# characters in the falling columns mutate as they fall
+mutate_chars: true
+
+# treat cleared input as a failed attempt (colour feedback)
+failonclear: false
+
+# rain colours per state ("#RRGGBB")
+fontcolour:
+    init: "#1cff7b"
+    input: "#28a99e"
+    failed: "#E28743"
+...

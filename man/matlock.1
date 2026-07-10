@@ -1,0 +1,129 @@
+.TH MATLOCK 1 "10 July 2026" "tvsos" "TVSOS Commands Manual"
+
+\"------------------------------------------------------------------------------
+
+.SH NAME
+
+.B matlock
+\- screen lock for X and Wayland with raining characters like in the film
+\fIThe Matrix\fP (1999).
+
+\"------------------------------------------------------------------------------
+
+.SH SYNOPSIS
+
+.SY
+.nf
+\fBmatlock\fR [\-v] [<command> [<args...>]]
+.fi
+.YS
+
+\"------------------------------------------------------------------------------
+
+.SH DESCRIPTION
+
+.PP
+\fBmatlock\fP, or Matrix Lock, is a screen lock program for X and Wayland
+written in C++. Initially a fork of the original C implementation
+\fBslock\fP, it has undergone considerable restructuring and revamping.
+
+If provided, [<command> [<args...>]] is executed after the screen has been
+unlocked.
+
+.SS BACKENDS
+.PP
+The display backend is chosen at runtime: if \fIWAYLAND_DISPLAY\fP is set,
+\fBmatlock\fP locks the session through the Wayland
+\fIext-session-lock-v1\fP protocol; otherwise, if \fIDISPLAY\fP is set, the
+X11 backend is used. An error is printed when neither is set.
+
+On Wayland, the compositor must support \fIext-session-lock-v1\fP. This
+includes niri, sway, river, Hyprland, KWin and other wlroots-based
+compositors; GNOME (Mutter) does not implement the protocol and is not
+supported. Every output is covered by a lock surface, including outputs
+plugged in while the session is locked.
+
+.SS SECURITY CONSIDERATIONS
+.PP
+On X11, to make sure a locked screen can not be bypassed by switching VTs or
+killing the X server with Ctrl+Alt+Backspace, it is recommended to disable
+them both in \fBxorg.conf(5)\fP for maximum security:
+
+.EX
+Section "ServerFlags"
+    Option "DontVTSwitch" "True"
+    Option "DontZap"      "True"
+EndSection
+.EE
+
+On Wayland, input exclusivity and the hiding of screen content are
+guaranteed by the compositor as part of the session-lock protocol; no
+further configuration is needed.
+
+.SS CUSTOMISATION
+.PP
+\fBmatlock\fP reads \fI/etc/matlock.yaml\fP and then per-user overrides from
+\fI$XDG_CONFIG_HOME/matlock/matlock.yaml\fP (usually
+\fI~/.config/matlock/matlock.yaml\fP). Both files are watched while the
+screen is locked and changes apply live. Only a flat "key: value" YAML
+subset is supported.
+
+.TP
+.B background
+background colour ("#RRGGBB").
+.TP
+.B font_pattern
+\fBfontconfig\fP(1) pattern for the rain glyphs (Wayland backend only; the
+X11 backend uses core bitmap fonts).
+.TP
+.B font_size
+pixel size of the closest rain layer (10..128). The farthest layer is fixed
+at 10 and the layers between interpolate linearly.
+.TP
+.B mutate_chars
+whether characters in the falling columns mutate (true/false).
+.TP
+.B failonclear
+treat cleared input as a failed attempt (true/false).
+.TP
+.B fontcolour
+mapping with \fBinit\fP, \fBinput\fP and \fBfailed\fP colours ("#RRGGBB")
+for the three states.
+
+.PP
+The user and group privileges are dropped to remain compile-time settings in
+\fIinclude/config.hpp\fP.
+
+\"------------------------------------------------------------------------------
+
+.SH OPTIONS
+
+.IP "\-v"
+print version information to the standard output and exit.
+
+\"------------------------------------------------------------------------------
+
+.SH FILES
+
+.TP
+.I /etc/matlock.yaml
+system-wide configuration.
+.TP
+.I $XDG_CONFIG_HOME/matlock/matlock.yaml
+per-user overrides (usually \fI~/.config/matlock/matlock.yaml\fP).
+
+\"------------------------------------------------------------------------------
+
+.SH BUGS
+
+https://github.com/sujaltv/matlock/issues
+
+\"------------------------------------------------------------------------------
+
+.SH SEE ALSO
+
+.UR https://git.suckless.org/slock/
+\fBslock\fP
+.UE .
+
+\"------------------------------------------------------------------------------

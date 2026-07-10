@@ -13,15 +13,32 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <memory>
 #include <unistd.h>
+#ifdef __linux__
+    #include <crypt.h>
+#endif
 
 #include "../include/arg.hpp"
 #include "../include/utils.hpp"
-#include "../include/matlock.hpp"
+#include "../include/auth.hpp"
+#include "../include/backend.hpp"
+#include "../include/conf.hpp"
+#include "../include/x11_backend.hpp"
+#include "../include/wl_backend.hpp"
 #include "../include/config.hpp"
 
 
 char *argv0;
+
+
+static void usage(void) {
+    /**
+     * Print usage.
+     */
+
+	Utils::die("usage: %s [-v] [cmd [arg ...]]\n", NAME);
+}
 
 
 const char* get_user_hash() {
@@ -64,7 +81,6 @@ const char* get_user_hash() {
 
 int main(int argc, char* argv[]) {
     srand(time(NULL) ^ getpid());
-    Matlock m;
 	const char *hash;
 	errno = 0;
 
@@ -74,13 +90,28 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "%s-" VERSION "\n", NAME);
             return 0;
         default:
-            Matlock::usage();
+            usage();
 	} ARGEND
+
+    /* load /etc/matlock.yaml and the per-user override, and watch both for
+     * live changes */
+    Conf conf;
+
+    /* pick the backend from the session environment and connect to the
+     * display server with real credentials, before the privilege drop in
+     * get_user_hash() */
+    std::unique_ptr<Backend> backend;
+    if (getenv("WAYLAND_DISPLAY"))
+        backend = std::make_unique<WlBackend>(conf);
+    else if (getenv("DISPLAY"))
+        backend = std::make_unique<X11Backend>(conf);
+    else
+        Utils::die("%s: neither WAYLAND_DISPLAY nor DISPLAY is set\n", NAME);
 
     hash = get_user_hash();
 
 	/* did we manage to lock everything? */
-	if (m.lock_screens(background)!= m.num_screens)
+	if (!backend->lock())
 		return 1;
 
 	/* run post-lock command */
@@ -89,7 +120,7 @@ int main(int argc, char* argv[]) {
 		case -1:
 			Utils::die("%s: fork failed: %s\n", NAME, strerror(errno));
 		case 0:
-			if (close(ConnectionNumber(m.disp)) < 0)
+			if (close(backend->conn_fd()) < 0)
 				Utils::die("%s: close: %s\n", NAME, strerror(errno));
 			execvp(argv[0], argv);
 			fprintf(stderr, "%s: execvp %s: %s\n", NAME, argv[0], strerror(errno));
@@ -98,7 +129,8 @@ int main(int argc, char* argv[]) {
 	}
 
 	/* everything is now blank. Wait for the correct password */
-    m.read_pwd(hash, mutate_chars, failonclear, fontcolour);
+    Auth auth(hash, conf.cfg().failonclear);
+    backend->run(auth);
 
 	return 0;
 }
