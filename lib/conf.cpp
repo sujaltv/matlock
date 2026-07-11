@@ -9,8 +9,10 @@
 #include <string>
 #include <unistd.h>
 #include <sys/inotify.h>
+#include <sys/types.h>
 
 #include "../include/conf.hpp"
+#include "../include/utils.hpp"
 
 #ifndef ETC_CONFIG
     #define ETC_CONFIG "/etc/matlock.yaml"
@@ -83,6 +85,22 @@ void set_bool(bool& into, const std::string& v, const char* path, int line) {
 }
 
 
+void set_int(int& into, const std::string& v, long lo, long hi,
+             const char* path, int line) {
+    char* end = nullptr;
+    long n = strtol(v.c_str(), &end, 10);
+    if (v.empty() || !end || *end != '\0') {
+        warn(path, line, "invalid value (expected an integer)", v);
+    } else if (n < lo || n > hi) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "value out of range (%ld..%ld)", lo, hi);
+        warn(path, line, msg, v);
+    } else {
+        into = (int)n;
+    }
+}
+
+
 void set_key(Config& c, bool in_fontcolour, const std::string& key,
              const std::string& v, const char* path, int line) {
     if (in_fontcolour) {
@@ -105,14 +123,26 @@ void set_key(Config& c, bool in_fontcolour, const std::string& key,
         else
             warn(path, line, "empty value", key);
     } else if (key == "font_size") {
-        char* end = nullptr;
-        long n = strtol(v.c_str(), &end, 10);
-        if (v.empty() || !end || *end != '\0') {
-            warn(path, line, "invalid font_size (expected an integer)", v);
-        } else if (n < FARTHEST_FONT_SIZE || n > 128) {
-            warn(path, line, "font_size out of range (10..128)", v);
-        } else {
-            c.font_size = (int)n;
+        set_int(c.font_size, v, FARTHEST_FONT_SIZE, 128, path, line);
+    } else if (key == "depth_levels") {
+        set_int(c.depth_levels, v, 1, 8, path, line);
+    } else if (key == "max_droplets") {
+        set_int(c.max_droplets, v, 16, 20000, path, line);
+    } else if (key == "droplet_length") {
+        set_int(c.droplet_length, v, 2, 200, path, line);
+    } else if (key == "spawn_attempts") {
+        set_int(c.spawn_attempts, v, 1, 32, path, line);
+    } else if (key == "charset") {
+        std::string filtered;
+        for (char ch : v)
+            if (ch >= 0x21 && ch <= 0x7E)
+                filtered += ch;
+        if (filtered.empty() || filtered.size() > 256)
+            warn(path, line, "invalid charset (1..256 printable ASCII characters)", v);
+        else {
+            if (filtered.size() != v.size())
+                warn(path, line, "charset: ignored non-printable-ASCII characters", v);
+            c.charset = filtered;
         }
     } else if (key == "mutate_chars") {
         set_bool(c.mutate_chars, v, path, line);
@@ -228,10 +258,36 @@ Conf::~Conf() {
 bool Conf::load(Config& into, bool initial) {
     into = Config{};
 
+    /* /etc/matlock.yaml is a fixed, root-owned path: safe to read as root. */
     ParseStatus etc = parse_file(ETC_CONFIG, into);
-    ParseStatus user = this->user_path_.empty()
-                       ? ParseStatus::Missing
-                       : parse_file(this->user_path_.c_str(), into);
+
+    /* The per-user file path derives from $XDG_CONFIG_HOME/$HOME, which the
+     * invoking user controls. The initial load runs with euid 0 (this is a
+     * suid binary), so a symlink there could make root open a file the user
+     * cannot: read it as the real user instead, letting the kernel resolve
+     * the whole path (symlinks, permissions) with the user's rights. The
+     * saved-set-uid is still root here, so the euid is restored afterwards.
+     * Hot reloads run after the permanent drop to 'nobody' (euid != 0), so
+     * the swap is skipped and the file is read as 'nobody', as before. */
+    ParseStatus user = ParseStatus::Missing;
+    if (!this->user_path_.empty()) {
+        uid_t ruid = getuid();
+        bool swapped = false;
+        if (geteuid() == 0 && ruid != 0) {
+            if (seteuid(ruid) == 0) {
+                swapped = true;
+            } else {
+                fprintf(stderr, "%s: refusing to read %s as root: %s\n", NAME,
+                        this->user_path_.c_str(), strerror(errno));
+                user = ParseStatus::Unreadable;
+            }
+        }
+        if (user != ParseStatus::Unreadable)
+            user = parse_file(this->user_path_.c_str(), into);
+        if (swapped && seteuid(0) != 0)
+            Utils::die("%s: could not restore privileges: %s\n", NAME,
+                       strerror(errno));
+    }
 
     /* on reload, refuse to apply a half-view of the configuration: keep the
      * current one until both files are readable again */

@@ -5,6 +5,7 @@
 #define CONF_HPP__
 
 #include <string>
+#include <vector>
 
 #include "auth.hpp"
 #include "rain.hpp"
@@ -26,16 +27,37 @@ struct Config {
         "#E28743",      /* States::FAILED */
     };
 
+    /* structural rain parameters */
+    int         depth_levels   = 4;
+    int         max_droplets   = 1000;
+    int         droplet_length = 50;
+    int         spawn_attempts = 2;
+    std::string charset        = MATRIX_CHARS;
+
     bool operator==(const Config&) const = default;
 };
 
 
+/* the structural subset that requires Rain::configure when it changes */
+static inline RainParams rain_params(const Config& c) {
+    RainParams p;
+    p.depth_levels = c.depth_levels;
+    p.max_droplets = c.max_droplets;
+    p.droplet_length = c.droplet_length;
+    p.spawn_attempts = c.spawn_attempts;
+    p.charset = c.charset;
+    return p;
+}
+
+
 /* per-depth pixel sizes: layer 0 is base, the last layer is
  * FARTHEST_FONT_SIZE, the layers between interpolate linearly (floored) */
-static inline void depth_font_sizes(int base, int sizes[DEPTH_LEVELS]) {
-    for (int i = 0; i < DEPTH_LEVELS; i++)
-        sizes[i] = (base * (DEPTH_LEVELS - 1 - i) + FARTHEST_FONT_SIZE * i)
-                   / (DEPTH_LEVELS - 1);
+static inline std::vector<int> depth_font_sizes(int base, int n) {
+    std::vector<int> sizes(n);
+    for (int i = 0; i < n; i++)
+        sizes[i] = n <= 1 ? base
+                          : (base * (n - 1 - i) + FARTHEST_FONT_SIZE * i) / (n - 1);
+    return sizes;
 }
 
 

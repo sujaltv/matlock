@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <array>
 #include <map>
 #include <memory>
 #include <vector>
@@ -41,10 +42,10 @@ struct Glyph {
     std::vector<uint8_t> cov;
 };
 
-/* all MATRIX_CHARS rasterised at the four depth sizes, for one buffer scale */
+/* the charset rasterised at every depth size, for one buffer scale */
 struct Atlas {
-    DepthMetrics metrics[DEPTH_LEVELS];
-    Glyph glyphs[DEPTH_LEVELS][128];    // indexed by ASCII char
+    std::vector<DepthMetrics> metrics;              // sized depth_levels
+    std::vector<std::array<Glyph, 128>> glyphs;     // [depth][ASCII char]
 };
 
 
@@ -118,11 +119,12 @@ struct WlBackend::Impl {
     std::map<int, Atlas> atlases;       // keyed by integer buffer scale
     FT_Library ft = nullptr;
     FT_Face face = nullptr;
-    uint32_t body_colour[States::NUMSTATES][DEPTH_LEVELS] = {};
-    uint32_t head_colour[States::NUMSTATES][DEPTH_LEVELS] = {};
-    int font_sizes[DEPTH_LEVELS] = {};
+    std::vector<uint32_t> body_colour[States::NUMSTATES];
+    std::vector<uint32_t> head_colour[States::NUMSTATES];
+    std::vector<int> font_sizes;
     std::string applied_pattern;        // pattern the current face came from
     int applied_size = 0;
+    RainParams applied_rain;            // structural params the rains use
 
     Auth* auth = nullptr;
     bool mutate_chars = false;
@@ -276,10 +278,12 @@ static bool ensure_buffers(WlBackend::Impl* impl, WlOutput* out, int bw, int bh)
 
 static void blit_glyph(uint32_t* px, int bw, int bh, const Glyph& g,
                        int ox, int oy, uint32_t col) {
-    /* (ox, oy) is the baseline origin, as with XDrawString */
+    /* (ox, oy) is the baseline origin, as with XDrawString. The channel
+     * maths must be signed: a dimmer glyph over a brighter pixel makes
+     * (r - dr) negative. */
     int x0 = ox + g.left;
     int y0 = oy - g.top;
-    uint32_t r = (col >> 16) & 0xFF, gc = (col >> 8) & 0xFF, b = col & 0xFF;
+    int r = (col >> 16) & 0xFF, gr = (col >> 8) & 0xFF, b = col & 0xFF;
 
     for (int row = 0; row < g.h; row++) {
         int y = y0 + row;
@@ -289,14 +293,14 @@ static void blit_glyph(uint32_t* px, int bw, int bh, const Glyph& g,
         for (int cx = 0; cx < g.w; cx++) {
             int x = x0 + cx;
             if (x < 0 || x >= bw) continue;
-            uint32_t cov = src[cx];
+            int cov = src[cx];
             if (!cov) continue;
             uint32_t d = dst[x];
-            uint32_t dr = (d >> 16) & 0xFF, dg = (d >> 8) & 0xFF, db = d & 0xFF;
+            int dr = (d >> 16) & 0xFF, dg = (d >> 8) & 0xFF, db = d & 0xFF;
             dst[x] = 0xFF000000
-                   | ((dr + (r - dr) * cov / 255) << 16)
-                   | ((dg + (gc - dg) * cov / 255) << 8)
-                   |  (db + (b - db) * cov / 255);
+                   | ((uint32_t)(dr + (r - dr) * cov / 255) << 16)
+                   | ((uint32_t)(dg + (gr - dg) * cov / 255) << 8)
+                   |  (uint32_t)(db + (b - db) * cov / 255);
         }
     }
 }
@@ -305,29 +309,32 @@ static void blit_glyph(uint32_t* px, int bw, int bh, const Glyph& g,
 static void draw_rain(WlBackend::Impl* impl, WlOutput* out, uint32_t* px,
                       const Atlas& atlas, int state) {
     /* body pass then head pass per depth, exactly as the X11 backend */
-    for (int d = 0; d < DEPTH_LEVELS; d++) {
+    for (int d = 0; d < out->rain.p.depth_levels; d++) {
         int dch = atlas.metrics[d].char_height;
 
         uint32_t body = impl->body_colour[state][d];
         for (int ai = 0; ai < out->rain.active_count; ai++) {
-            const Droplet& drop = out->rain.droplets[out->rain.active_list[ai]];
+            int i = out->rain.active_list[ai];
+            const Droplet& drop = out->rain.droplets[i];
             if (drop.depth != d) continue;
+            const char* dc = out->rain.droplet_chars(i);
             for (int j = 1; j < drop.length; j++) {
                 int y = drop.y - (j * dch);
                 if (y < 0 || y > out->buf_h) continue;
                 blit_glyph(px, out->buf_w, out->buf_h,
-                           atlas.glyphs[d][(unsigned char)drop.chars[j] & 0x7F],
+                           atlas.glyphs[d][(unsigned char)dc[j] & 0x7F],
                            drop.x, y, body);
             }
         }
 
         uint32_t head = impl->head_colour[state][d];
         for (int ai = 0; ai < out->rain.active_count; ai++) {
-            const Droplet& drop = out->rain.droplets[out->rain.active_list[ai]];
+            int i = out->rain.active_list[ai];
+            const Droplet& drop = out->rain.droplets[i];
             if (drop.depth != d) continue;
             if (drop.y >= 0 && drop.y <= out->buf_h) {
                 blit_glyph(px, out->buf_w, out->buf_h,
-                           atlas.glyphs[d][(unsigned char)drop.chars[0] & 0x7F],
+                           atlas.glyphs[d][(unsigned char)out->rain.droplet_chars(i)[0] & 0x7F],
                            drop.x, drop.y, head);
             }
         }
@@ -376,12 +383,12 @@ void WlBackend::Impl::render_and_commit(WlOutput* out, bool want_frame) {
 
             if (this->render_ready) {
                 const Atlas& atlas = this->atlas_for(sc);
-                memcpy(out->rain.metrics, atlas.metrics, sizeof(atlas.metrics));
                 if (!out->rain_ready) {
-                    out->rain.init((uint32_t)rand());
+                    out->rain.configure(this->applied_rain, (uint32_t)rand());
                     clock_gettime(CLOCK_MONOTONIC, &out->last_step);
                     out->rain_ready = true;
                 }
+                out->rain.metrics = atlas.metrics;
                 int state = this->auth ? this->auth->state() : States::INIT;
                 draw_rain(this, out, px, atlas, state);
                 out->last_drawn_state = state;
@@ -450,8 +457,11 @@ const Atlas& WlBackend::Impl::atlas_for(int scale) {
     if (it != this->atlases.end())
         return it->second;
 
+    int n = this->applied_rain.depth_levels;
     Atlas& atlas = this->atlases[scale];
-    for (int d = 0; d < DEPTH_LEVELS; d++) {
+    atlas.metrics.resize(n);
+    atlas.glyphs.resize(n);
+    for (int d = 0; d < n; d++) {
         if (FT_Set_Pixel_Sizes(this->face, 0, this->font_sizes[d] * scale))
             Utils::die("%s: FT_Set_Pixel_Sizes failed\n", NAME);
 
@@ -463,8 +473,7 @@ const Atlas& WlBackend::Impl::atlas_for(int scale) {
             (int)((this->face->size->metrics.ascender -
                    this->face->size->metrics.descender) >> 6);
 
-        for (int c = 0; c < NUM_MATRIX_CHARS; c++) {
-            unsigned char ch = (unsigned char)MATRIX_CHARS[c];
+        for (unsigned char ch : this->applied_rain.charset) {
             if (FT_Load_Char(this->face, ch, FT_LOAD_RENDER))
                 continue;
             const FT_Bitmap& bm = this->face->glyph->bitmap;
@@ -540,24 +549,40 @@ void WlBackend::Impl::apply_config() {
 
     const Config& c = this->conf->cfg();
 
-    this->background = 0xFF000000 | parse_hex(c.background.c_str());
-    for (int st = 0; st < States::NUMSTATES; st++) {
-        uint32_t rgb = parse_hex(c.fontcolour[st].c_str());
-        for (int d = 0; d < DEPTH_LEVELS; d++) {
-            float a = depth_alpha[d];
-            this->body_colour[st][d] = dim(rgb, a);
-            this->head_colour[st][d] = dim(rgb, std::min(1.0f, a * 1.3f));
-        }
-    }
     this->mutate_chars = c.mutate_chars;
     if (this->auth)
         this->auth->set_failonclear(c.failonclear);
 
-    bool font_changed = false;
+    bool rebuild = false;
+
+    RainParams np = rain_params(c);
+    if (!(np == this->applied_rain)) {
+        this->applied_rain = np;
+        /* structural change: restart the simulations */
+        for (auto& out : this->outputs) {
+            if (out->rain_ready)
+                out->rain.configure(np, (uint32_t)rand());
+        }
+        rebuild = true;
+    }
+
+    int n = this->applied_rain.depth_levels;
+    this->background = 0xFF000000 | parse_hex(c.background.c_str());
+    for (int st = 0; st < States::NUMSTATES; st++) {
+        uint32_t rgb = parse_hex(c.fontcolour[st].c_str());
+        this->body_colour[st].resize(n);
+        this->head_colour[st].resize(n);
+        for (int d = 0; d < n; d++) {
+            float a = sample_curve(DEPTH_ALPHA_CURVE, n, d);
+            this->body_colour[st][d] = dim(rgb, a);
+            this->head_colour[st][d] = dim(rgb, std::min(1.0f, a * 1.3f));
+        }
+    }
+
     if (c.font_pattern != this->applied_pattern) {
         if (this->init_fonts(c.font_pattern.c_str())) {
             this->applied_pattern = c.font_pattern;
-            font_changed = true;
+            rebuild = true;
         } else {
             fprintf(stderr, "%s: keeping font '%s'\n", NAME,
                     this->applied_pattern.c_str());
@@ -565,10 +590,10 @@ void WlBackend::Impl::apply_config() {
     }
     if (c.font_size != this->applied_size) {
         this->applied_size = c.font_size;
-        font_changed = true;
+        rebuild = true;
     }
-    if (font_changed) {
-        depth_font_sizes(this->applied_size, this->font_sizes);
+    if (rebuild) {
+        this->font_sizes = depth_font_sizes(this->applied_size, n);
         this->atlases.clear();
     }
 }
@@ -929,7 +954,9 @@ WlBackend::WlBackend(Conf& conf)
                    c.font_pattern.c_str());
     impl->applied_pattern = c.font_pattern;
     impl->applied_size = c.font_size;
-    depth_font_sizes(impl->applied_size, impl->font_sizes);
+    impl->applied_rain = rain_params(c);
+    impl->font_sizes = depth_font_sizes(impl->applied_size,
+                                        impl->applied_rain.depth_levels);
     impl->apply_config();
 }
 

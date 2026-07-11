@@ -74,10 +74,16 @@ void X11Backend::run(Auth& auth) {
 	while (!auth.unlocked()) {
         // Apply configuration changes live
         if (this->conf_.reload_if_changed()) {
-            auth.set_failonclear(this->conf_.cfg().failonclear);
+            const Config& cfg = this->conf_.cfg();
+            auth.set_failonclear(cfg.failonclear);
             colour = auth.state();
-            for (auto& mon : this->monitors)
-                mon->apply_config(this->disp, this->conf_.cfg(), colour);
+            RainParams np = rain_params(cfg);
+            for (auto& mon : this->monitors) {
+                // structural changes restart the simulation
+                if (!(mon->rain.p == np))
+                    mon->rain.configure(np, (uint32_t)rand());
+                mon->apply_config(this->disp, cfg, colour);
+            }
             oldc = colour;
         }
 
@@ -268,11 +274,13 @@ bool X11Backend::lock() {
 
 
 void Monitor::cleanup(Display* disp) {
-    for (int d = 0; d < DEPTH_LEVELS; d++) {
+    for (size_t d = 0; d < this->font.size(); d++) {
         if (this->font[d]) {
             XFreeFont(disp, this->font[d]);
             this->font[d] = nullptr;
         }
+    }
+    for (size_t d = 0; d < this->gc.size(); d++) {
         if (this->gc[d]) {
             XFreeGC(disp, this->gc[d]);
             this->gc[d] = 0;
@@ -317,13 +325,23 @@ void Monitor::setup_rain_resources(Display* disp, const Config& cfg) {
      */
 
     XGCValues gcv;
+    int n = cfg.depth_levels;
 
     // Font pixel sizes per depth: closer = larger, farther = smaller
-    int sizes[DEPTH_LEVELS];
-    depth_font_sizes(cfg.font_size, sizes);
+    std::vector<int> sizes = depth_font_sizes(cfg.font_size, n);
     char font_name[128];
 
-    for (int d = 0; d < DEPTH_LEVELS; d++) {
+    // free resources beyond the new depth count before shrinking
+    for (size_t d = n; d < this->font.size(); d++) {
+        if (this->font[d])
+            XFreeFont(disp, this->font[d]);
+        if (this->gc[d])
+            XFreeGC(disp, this->gc[d]);
+    }
+    this->font.resize(n, nullptr);
+    this->gc.resize(n, 0);
+
+    for (int d = 0; d < n; d++) {
         snprintf(font_name, sizeof(font_name),
             "-misc-fixed-medium-r-semicondensed--%d-*-*-*-c-*-iso8859-1",
             sizes[d]);
@@ -349,8 +367,10 @@ void Monitor::setup_rain_resources(Display* disp, const Config& cfg) {
 
     /* allocate depth-dimmed colour variants for each state */
     for (int st = 0; st < States::NUMSTATES; st++) {
-        for (int d = 0; d < DEPTH_LEVELS; d++) {
-            float a = depth_alpha[d];
+        this->body_colour[st].resize(n);
+        this->head_colour[st].resize(n);
+        for (int d = 0; d < n; d++) {
+            float a = sample_curve(DEPTH_ALPHA_CURVE, n, d);
             const char* hex = cfg.fontcolour[st].c_str();
             this->body_colour[st][d] = alloc_dimmed_colour(disp, this->screen_num, hex, a);
             this->head_colour[st][d] = alloc_dimmed_colour(disp, this->screen_num, hex,
@@ -366,6 +386,9 @@ void Monitor::init_rain(Display* disp, const Config& cfg) {
      * Matrix.
      */
 
+    // size the simulation before the metrics are filled in
+    this->rain.configure(rain_params(cfg), (uint32_t)rand());
+
     this->setup_rain_resources(disp, cfg);
 
     // Create backbuffer for double-buffering
@@ -373,9 +396,6 @@ void Monitor::init_rain(Display* disp, const Config& cfg) {
     int height = DisplayHeight(disp, this->screen_num);
     int depth = DefaultDepth(disp, this->screen_num);
     this->backbuffer = XCreatePixmap(disp, this->win, width, height, depth);
-
-    // initialise droplets as a free-list
-    this->rain.init((uint32_t)rand());
 }
 
 
@@ -406,11 +426,11 @@ void Monitor::draw_rain(Display* disp, int current_state) {
     XSetForeground(disp, this->gc[0], this->colours[States::INIT]);
     XFillRectangle(disp, dst, this->gc[0], 0, 0, width, height);
 
-    unsigned long* body_colour = this->body_colour[current_state];
-    unsigned long* head_colour = this->head_colour[current_state];
+    const std::vector<unsigned long>& body_colour = this->body_colour[current_state];
+    const std::vector<unsigned long>& head_colour = this->head_colour[current_state];
 
-    // Draw grouped by depth -- only 8 XSetForeground calls total
-    for (int d = 0; d < DEPTH_LEVELS; d++) {
+    // Draw grouped by depth -- two XSetForeground calls per depth in total
+    for (int d = 0; d < this->rain.p.depth_levels; d++) {
         GC dgc = this->gc[d];
         int dch = this->rain.metrics[d].char_height;
 
@@ -421,10 +441,11 @@ void Monitor::draw_rain(Display* disp, int current_state) {
             struct Droplet& drop = this->rain.droplets[i];
             if (drop.depth != d) continue;
 
+            const char* dc = this->rain.droplet_chars(i);
             for (int j = 1; j < drop.length; j++) {
                 int y = drop.y - (j * dch);
                 if (y < 0 || y > height) continue;
-                XDrawString(disp, dst, dgc, drop.x, y, &drop.chars[j], 1);
+                XDrawString(disp, dst, dgc, drop.x, y, &dc[j], 1);
             }
         }
 
@@ -437,7 +458,7 @@ void Monitor::draw_rain(Display* disp, int current_state) {
 
             int y = drop.y;
             if (y >= 0 && y <= height) {
-                XDrawString(disp, dst, dgc, drop.x, y, &drop.chars[0], 1);
+                XDrawString(disp, dst, dgc, drop.x, y, this->rain.droplet_chars(i), 1);
             }
         }
     }

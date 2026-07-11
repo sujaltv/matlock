@@ -53,18 +53,27 @@ is locked and changes apply live. Only a flat `key: value` YAML subset is
 supported; see the installed `/etc/matlock.yaml` for a commented example.
 
 ```
-Key           Default      Purpose
-------------  -----------  -----------------------------------------
-background    "#141D1A"    background colour
-font_pattern  monospace    fontconfig pattern for the rain glyphs
-                           (Wayland only; X11 uses core fonts)
-font_size     20           pixel size of the closest rain layer
-                           (10..128); farther layers interpolate
-                           linearly down to 10
-mutate_chars  true         characters in falling columns mutate
-failonclear   false        treat cleared input as failed (colour)
-fontcolour    init/input/  rain colours per state ("#RRGGBB")
-              failed
+Key             Default      Purpose
+--------------  -----------  ---------------------------------------
+background      "#141D1A"    background colour
+font_pattern    monospace    fontconfig pattern for the rain glyphs
+                             (Wayland only; X11 uses core fonts)
+font_size       20           pixel size of the closest rain layer
+                             (10..128); farther layers interpolate
+                             linearly down to 10
+depth_levels    4            number of depth layers (1..8); closer
+                             layers are larger, brighter, faster
+                             and longer
+max_droplets    1000         size of the droplet pool (16..20000)
+droplet_length  50           longest stream in characters (2..200)
+spawn_attempts  2            spawn attempts per simulation step
+                             (1..32), 1-in-5 chance each
+charset         A-Z 0-9 …    characters the streams are made of
+                             (printable ASCII)
+mutate_chars    true         characters in falling columns mutate
+failonclear     false        treat cleared input as failed (colour)
+fontcolour      init/input/  rain colours per state ("#RRGGBB")
+                failed
 ```
 
 The user and group privileges are dropped to remain compile-time settings

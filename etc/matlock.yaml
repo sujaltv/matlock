@@ -18,6 +18,23 @@ font_pattern: monospace
 # interpolate linearly down to 10
 font_size: 20
 
+# number of depth layers (1..8): closer layers are larger, brighter,
+# faster and longer
+depth_levels: 4
+
+# size of the droplet pool (16..20000)
+max_droplets: 1000
+
+# longest stream, in characters (2..200)
+droplet_length: 50
+
+# droplet spawn attempts per simulation step (1..32), 1-in-5 chance each
+spawn_attempts: 2
+
+# characters the streams are made of (printable ASCII, no spaces; written
+# unquoted because the set contains both quote characters)
+charset: ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789~`!@#$%^&*()_+-=[]{}\;:'",<.>/?
+
 # characters in the falling columns mutate as they fall
 mutate_chars: true
 

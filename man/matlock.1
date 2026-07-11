@@ -80,6 +80,24 @@ X11 backend uses core bitmap fonts).
 pixel size of the closest rain layer (10..128). The farthest layer is fixed
 at 10 and the layers between interpolate linearly.
 .TP
+.B depth_levels
+number of depth layers (1..8, default 4). Closer layers are larger,
+brighter, faster and longer; the classic four-level look is interpolated
+across the configured count.
+.TP
+.B max_droplets
+size of the droplet pool (16..20000, default 1000).
+.TP
+.B droplet_length
+longest stream, in characters (2..200, default 50).
+.TP
+.B spawn_attempts
+droplet spawn attempts per simulation step, each with a 1-in-5 chance
+(1..32, default 2).
+.TP
+.B charset
+the printable-ASCII characters the streams are made of.
+.TP
 .B mutate_chars
 whether characters in the falling columns mutate (true/false).
 .TP

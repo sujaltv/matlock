@@ -41,12 +41,12 @@ struct Monitor {
         /* rain simulation state */
         struct Rain rain;
 
-        /* X11 rendering resources for the rain */
-        XFontStruct* font[DEPTH_LEVELS];
-        GC gc[DEPTH_LEVELS];
+        /* X11 rendering resources for the rain (sized to depth_levels) */
+        std::vector<XFontStruct*> font;
+        std::vector<GC> gc;
         Pixmap backbuffer;
-        unsigned long body_colour[States::NUMSTATES][DEPTH_LEVELS];
-        unsigned long head_colour[States::NUMSTATES][DEPTH_LEVELS];
+        std::vector<unsigned long> body_colour[States::NUMSTATES];
+        std::vector<unsigned long> head_colour[States::NUMSTATES];
 
         /* initialise rain resources for this monitor */
         void init_rain(Display*, const Config&);

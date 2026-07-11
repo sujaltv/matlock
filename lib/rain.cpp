@@ -4,17 +4,32 @@
 #include "../include/rain.hpp"
 
 
-void Rain::init(uint32_t seed) {
+void Rain::configure(const RainParams& params, uint32_t seed) {
     /**
-     * Initialise the droplets as a free-list and seed the PRNG.
+     * Size the droplet pool and per-depth tables for the given parameters,
+     * derive the depth curves, and reset the droplets to a free-list.
      */
+
+    this->p = params;
+    this->droplets.assign(this->p.max_droplets, Droplet{});
+    this->chars.assign((size_t)this->p.max_droplets * this->p.droplet_length, 0);
+    this->active_list.assign(this->p.max_droplets, 0);
+    this->metrics.assign(this->p.depth_levels, DepthMetrics{});
+
+    this->speed_base.resize(this->p.depth_levels);
+    this->length_scale.resize(this->p.depth_levels);
+    for (int d = 0; d < this->p.depth_levels; d++) {
+        float sp = sample_curve(DEPTH_SPEED_CURVE, this->p.depth_levels, d);
+        this->speed_base[d] = sp < 1.0f ? 1 : (int)(sp + 0.5f);
+        this->length_scale[d] = sample_curve(DEPTH_LENGTH_CURVE, this->p.depth_levels, d);
+    }
 
     this->free_head = 0;
     this->active_count = 0;
     this->rng_state = seed | 1; // must be non-zero
-    for (int i = 0; i < MAX_DROPLETS; i++) {
+    for (int i = 0; i < this->p.max_droplets; i++) {
         this->droplets[i].active = 0;
-        this->droplets[i].x = (i + 1 < MAX_DROPLETS) ? i + 1 : -1;
+        this->droplets[i].x = (i + 1 < this->p.max_droplets) ? i + 1 : -1;
     }
 }
 
@@ -46,24 +61,26 @@ void Rain::rain_droplet(int width, int height) {
         this->active_list[worst_ai] = this->active_list[--this->active_count];
     }
 
-    this->droplets[idx].x = fast_rand(this->rng_state) % width;
-    this->droplets[idx].y = 0;
-    this->droplets[idx].depth = fast_rand(this->rng_state) % DEPTH_LEVELS;
-    switch (this->droplets[idx].depth) {
-        case 0: this->droplets[idx].speed = 5 + (fast_rand(this->rng_state) % 2); break;
-        case 1: this->droplets[idx].speed = 3 + (fast_rand(this->rng_state) % 2); break;
-        case 2: this->droplets[idx].speed = 2 + (fast_rand(this->rng_state) % 2); break;
-        case 3: this->droplets[idx].speed = 1;                                     break;
-    }
+    struct Droplet& drop = this->droplets[idx];
+    drop.x = fast_rand(this->rng_state) % width;
+    drop.y = 0;
+    drop.depth = fast_rand(this->rng_state) % this->p.depth_levels;
+    // Closer droplets are faster; all but the farthest level get jitter
+    drop.speed = this->speed_base[drop.depth];
+    if (drop.depth < this->p.depth_levels - 1)
+        drop.speed += fast_rand(this->rng_state) % 2;
     // Closer droplets are longer, farther ones shorter
-    static const float depth_length_scale[DEPTH_LEVELS] = {1.0f, 0.7f, 0.45f, 0.25f};
-    int max_len = (int)(DROPLET_LENGTH * depth_length_scale[this->droplets[idx].depth]);
-    this->droplets[idx].length = max_len - (fast_rand(this->rng_state) % (max_len / 2 + 1));
-    this->droplets[idx].active = 1;
+    int max_len = (int)(this->p.droplet_length * this->length_scale[drop.depth]);
+    if (max_len < 1) max_len = 1;
+    drop.length = max_len - (fast_rand(this->rng_state) % (max_len / 2 + 1));
+    if (drop.length < 1) drop.length = 1;
+    drop.active = 1;
     this->active_list[this->active_count++] = idx;
 
-    for (int j = 0; j < this->droplets[idx].length; j++) {
-        this->droplets[idx].chars[j] = MATRIX_CHARS[fast_rand(this->rng_state) % NUM_MATRIX_CHARS];
+    char* dc = this->droplet_chars(idx);
+    int ncs = (int)this->p.charset.size();
+    for (int j = 0; j < drop.length; j++) {
+        dc[j] = this->p.charset[fast_rand(this->rng_state) % ncs];
     }
 }
 
@@ -74,11 +91,13 @@ void Rain::step(int width, int height, bool mutate_chars) {
      * off-screen ones, mutate characters and move everything down.
      */
 
-    // Randomly create new droplets (spawn up to 2 per frame)
-    for (int s = 0; s < NUM_THREADS_PER_FRAME; s++) {
+    // Randomly create new droplets
+    for (int s = 0; s < this->p.spawn_attempts; s++) {
         if (fast_rand(this->rng_state) % 5 == 0)
             this->rain_droplet(width, height);
     }
+
+    int ncs = (int)this->p.charset.size();
 
     // Update positions, mutate chars, deactivate off-screen droplets
     for (int ai = 0; ai < this->active_count; ai++) {
@@ -100,11 +119,12 @@ void Rain::step(int width, int height, bool mutate_chars) {
 
         // Mutate characters
         if (mutate_chars) {
+            char* dc = this->droplet_chars(i);
             uint32_t rnd = fast_rand(this->rng_state);
             int bits_left = 6;
             for (int j = 0; j < drop.length; j++) {
                 if ((rnd & 0x1F) < 2) {
-                    drop.chars[j] = MATRIX_CHARS[fast_rand(this->rng_state) % NUM_MATRIX_CHARS];
+                    dc[j] = this->p.charset[fast_rand(this->rng_state) % ncs];
                 }
                 rnd >>= 5;
                 if (--bits_left <= 0) {

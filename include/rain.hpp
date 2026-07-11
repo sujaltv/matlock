@@ -4,38 +4,47 @@
 #ifndef RAIN_HPP__
 #define RAIN_HPP__
 
-/* The Matrix-like rain-related constants */
-#define MAX_DROPLETS 1000
-#define NUM_THREADS_PER_FRAME 2
-#define DROPLET_LENGTH 50
+/* default charset for the raining characters */
 #define MATRIX_CHARS "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789~`!@#$%^&*()_+-=[]{}\\;:'\",<.>/?"
-#define NUM_MATRIX_CHARS ((int)sizeof(MATRIX_CHARS) - 1)
+
+/* one simulation step per this many microseconds */
 #define UPDATE_INTERVAL 10042
-#define DEPTH_LEVELS 4
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 
 struct Droplet {
     int active;                         // Whether this stream is currently active
-    int depth;                          // Depth level (0 = closest, DEPTH_LEVELS-1 = farthest)
+    int depth;                          // Depth level (0 = closest)
     int x;                              // x position
     int y;                              // y position
     int speed;                          // How many pixels to move per update
     int length;                         // Actual length of this stream
-    char chars[DROPLET_LENGTH];         // Characters in this stream (cold, accessed only during draw)
 };
 
 
-/* per-depth glyph cell metrics, filled in by the backend at init */
+/* per-depth glyph cell metrics, filled in by the backend */
 struct DepthMetrics {
     int char_width;
     int char_height;
 };
 
 
-/* body alpha per depth; head colours use min(1.0, alpha * 1.3) */
-static const float depth_alpha[DEPTH_LEVELS] = {1.0f, 0.65f, 0.4f, 0.2f};
+/* The classic four-level depth look, kept as anchor curves and resampled to
+ * the configured number of levels: exact at four, interpolated otherwise. */
+static const float DEPTH_ALPHA_CURVE[4]  = {1.0f, 0.65f, 0.4f, 0.2f};
+static const float DEPTH_LENGTH_CURVE[4] = {1.0f, 0.7f, 0.45f, 0.25f};
+static const float DEPTH_SPEED_CURVE[4]  = {5.0f, 3.0f, 2.0f, 1.0f};
+
+static inline float sample_curve(const float a[4], int n, int i) {
+    if (n <= 1) return a[0];
+    float t = (float)i * 3.0f / (float)(n - 1);
+    int k = (int)t;
+    if (k >= 3) return a[3];
+    return a[k] + (a[k + 1] - a[k]) * (t - (float)k);
+}
 
 
 /* xorshift32 PRNG */
@@ -44,17 +53,42 @@ static inline uint32_t fast_rand(uint32_t& s) {
 }
 
 
+/* structural simulation parameters (from the configuration); changing any
+ * of these requires Rain::configure */
+struct RainParams {
+    int depth_levels = 4;
+    int max_droplets = 1000;
+    int droplet_length = 50;            // longest stream, in characters
+    int spawn_attempts = 2;             // spawn attempts per step, 1-in-5 each
+    std::string charset = MATRIX_CHARS;
+
+    bool operator==(const RainParams&) const = default;
+};
+
+
 struct Rain {
     public:
-        struct Droplet droplets[MAX_DROPLETS];
-        int active_list[MAX_DROPLETS];      // Indices of active droplets
-        int active_count;                   // Number of active droplets
-        int free_head;                      // Head of free-list (-1 = empty)
-        uint32_t rng_state;                 // xorshift32 PRNG state
-        struct DepthMetrics metrics[DEPTH_LEVELS];
+        RainParams p;
+        std::vector<Droplet> droplets;
+        std::vector<char> chars;            // p.droplet_length chars per droplet
+        std::vector<int> active_list;       // Indices of active droplets
+        std::vector<DepthMetrics> metrics;  // sized p.depth_levels
+        std::vector<int> speed_base;        // per-depth base speed
+        std::vector<float> length_scale;    // per-depth length factor
+        int active_count = 0;               // Number of active droplets
+        int free_head = -1;                 // Head of free-list (-1 = empty)
+        uint32_t rng_state = 1;             // xorshift32 PRNG state
 
-        /* reset droplets to a free-list and seed the PRNG */
-        void init(uint32_t seed);
+        /* size everything for the given parameters and reset the free-list */
+        void configure(const RainParams& params, uint32_t seed);
+
+        /* the character stream of droplet i */
+        char* droplet_chars(int i) {
+            return &this->chars[(size_t)i * this->p.droplet_length];
+        }
+        const char* droplet_chars(int i) const {
+            return &this->chars[(size_t)i * this->p.droplet_length];
+        }
 
         /* spawn a single droplet */
         void rain_droplet(int width, int height);
