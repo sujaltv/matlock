@@ -31,8 +31,13 @@ struct Config {
     int         depth_levels   = 4;
     int         max_droplets   = 1000;
     int         droplet_length = 50;
-    int         spawn_attempts = 2;
+    int         spawn_attempts = 1;
+    int         fps            = 20;
     std::string charset        = MATRIX_CHARS;
+
+    /* pacing and resource behaviour */
+    int         idle_timeout   = 0;     // seconds; 0 disables the idle pause
+    bool        hidpi          = true;  // render HiDPI outputs at buffer scale
 
     bool operator==(const Config&) const = default;
 };
@@ -45,6 +50,7 @@ static inline RainParams rain_params(const Config& c) {
     p.max_droplets = c.max_droplets;
     p.droplet_length = c.droplet_length;
     p.spawn_attempts = c.spawn_attempts;
+    p.fps = c.fps;
     p.charset = c.charset;
     return p;
 }

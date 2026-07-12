@@ -10,8 +10,7 @@
 # background colour ("#RRGGBB")
 background: "#141D1A"
 
-# fontconfig pattern for the rain glyphs (Wayland backend only; the X11
-# backend uses core bitmap fonts)
+# fontconfig pattern for the rain glyphs (both backends)
 font_pattern: monospace
 
 # pixel size of the closest rain layer (10..128); the farther layers
@@ -28,8 +27,25 @@ max_droplets: 1000
 # longest stream, in characters (2..200)
 droplet_length: 50
 
-# droplet spawn attempts per simulation step (1..32), 1-in-5 chance each
-spawn_attempts: 2
+# droplet spawn attempts per simulation step (1..32), 1-in-5 chance each;
+# this is the main density knob -- raise it for heavier rain
+spawn_attempts: 1
+
+# animation frame rate (10..120). The simulation is rescaled so the
+# on-screen speed, density and mutation rate are the same at any value;
+# lower means less CPU with coarser motion. On HiDPI Wayland outputs,
+# "hidpi: false" below cuts CPU far more than lowering this.
+fps: 20
+
+# freeze the animation after this many seconds without input (0..86400,
+# 0 disables, the default); when set, the process sleeps at ~0% CPU until a
+# key press (or, on X11, a pointer move) resumes it
+idle_timeout: 0
+
+# render at the output's full buffer scale on HiDPI displays; set false to
+# render at scale 1 and let the compositor upscale (less CPU and memory on
+# Retina-class outputs, at some crispness cost; Wayland only)
+hidpi: true
 
 # characters the streams are made of (printable ASCII, no spaces; written
 # unquoted because the set contains both quote characters)

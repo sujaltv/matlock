@@ -16,13 +16,30 @@ void Rain::configure(const RainParams& params, uint32_t seed) {
     this->active_list.assign(this->p.max_droplets, 0);
     this->metrics.assign(this->p.depth_levels, DepthMetrics{});
 
+    /* The curves are px/tick at RAIN_REF_HZ; rescale so the on-screen
+     * velocity (px/s) is preserved at the configured fps: fewer, larger
+     * steps at a lower fps, but the same distance covered per second. */
+    float rescale = (float)RAIN_REF_HZ / (float)this->p.fps;
     this->speed_base.resize(this->p.depth_levels);
     this->length_scale.resize(this->p.depth_levels);
     for (int d = 0; d < this->p.depth_levels; d++) {
-        float sp = sample_curve(DEPTH_SPEED_CURVE, this->p.depth_levels, d);
+        float sp = sample_curve(DEPTH_SPEED_CURVE, this->p.depth_levels, d) * rescale;
         this->speed_base[d] = sp < 1.0f ? 1 : (int)(sp + 0.5f);
         this->length_scale[d] = sample_curve(DEPTH_LENGTH_CURVE, this->p.depth_levels, d);
     }
+
+    /* head-speed jitter: fast_rand % speed_jitter; at RAIN_REF_HZ this is
+     * % 2 (0..1 px/tick), as it always was, and its mean px/s is held */
+    this->speed_jitter = (int)(rescale + 0.5f) + 1;
+    if (this->speed_jitter < 2) this->speed_jitter = 2;
+    /* spawn probability per attempt is RAIN_REF_HZ / spawn_mod == 20/fps, so
+     * the expected spawns/s stay spawn_attempts * RAIN_REF_HZ / 5 for fps > 20;
+     * below that the per-attempt probability saturates at 1 and density falls
+     * off (an accepted edge, well outside the default fps=30) */
+    this->spawn_mod = 5 * this->p.fps;
+    /* mutation chance per char per tick, held near 6.25/s per char */
+    int mt = (int)(2.0f * rescale + 0.5f);
+    this->mutate_threshold = mt > 31 ? 31 : (mt < 1 ? 1 : mt);
 
     this->free_head = 0;
     this->active_count = 0;
@@ -68,7 +85,7 @@ void Rain::rain_droplet(int width, int height) {
     // Closer droplets are faster; all but the farthest level get jitter
     drop.speed = this->speed_base[drop.depth];
     if (drop.depth < this->p.depth_levels - 1)
-        drop.speed += fast_rand(this->rng_state) % 2;
+        drop.speed += fast_rand(this->rng_state) % this->speed_jitter;
     // Closer droplets are longer, farther ones shorter
     int max_len = (int)(this->p.droplet_length * this->length_scale[drop.depth]);
     if (max_len < 1) max_len = 1;
@@ -93,7 +110,7 @@ void Rain::step(int width, int height, bool mutate_chars) {
 
     // Randomly create new droplets
     for (int s = 0; s < this->p.spawn_attempts; s++) {
-        if (fast_rand(this->rng_state) % 5 == 0)
+        if ((int)(fast_rand(this->rng_state) % this->spawn_mod) < RAIN_REF_HZ)
             this->rain_droplet(width, height);
     }
 
@@ -123,7 +140,7 @@ void Rain::step(int width, int height, bool mutate_chars) {
             uint32_t rnd = fast_rand(this->rng_state);
             int bits_left = 6;
             for (int j = 0; j < drop.length; j++) {
-                if ((rnd & 0x1F) < 2) {
+                if ((int)(rnd & 0x1F) < this->mutate_threshold) {
                     dc[j] = this->p.charset[fast_rand(this->rng_state) % ncs];
                 }
                 rnd >>= 5;

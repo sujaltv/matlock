@@ -14,7 +14,7 @@
 
 .SY
 .nf
-\fBmatlock\fR [\-v] [<command> [<args...>]]
+\fBmatlock\fR [\-v] [\-b [<frames>]] [<command> [<args...>]]
 .fi
 .YS
 
@@ -73,8 +73,8 @@ subset is supported.
 background colour ("#RRGGBB").
 .TP
 .B font_pattern
-\fBfontconfig\fP(1) pattern for the rain glyphs (Wayland backend only; the
-X11 backend uses core bitmap fonts).
+\fBfontconfig\fP(1) pattern for the rain glyphs. Both backends rasterise
+this font with FreeType and present an identical software-rendered frame.
 .TP
 .B font_size
 pixel size of the closest rain layer (10..128). The farthest layer is fixed
@@ -93,7 +93,28 @@ longest stream, in characters (2..200, default 50).
 .TP
 .B spawn_attempts
 droplet spawn attempts per simulation step, each with a 1-in-5 chance
-(1..32, default 2).
+(1..32, default 1). The main rain-density control; raise it for heavier
+rain.
+.TP
+.B fps
+animation frame rate (10..120, default 20). The simulation is rescaled so
+the on-screen droplet velocity, spawn density and mutation rate are
+identical at any value; a lower rate uses less CPU with coarser motion. On
+HiDPI Wayland outputs, \fBhidpi\fP below reduces CPU far more than lowering
+this.
+.TP
+.B idle_timeout
+seconds without input before the animation freezes and the process sleeps at
+near-zero CPU until input resumes it (0..86400, default 0, which disables the
+idle pause). When enabled, a key press resumes it on both backends and a
+pointer move resumes it on X11. Off by default so the rain never appears to
+freeze; enable it to save power while away.
+.TP
+.B hidpi
+render at the output's full buffer scale on HiDPI displays (true/false,
+default true). When false, buffers are rendered at scale 1 and the
+compositor upscales, cutting CPU and memory on Retina-class outputs at some
+crispness cost (Wayland only).
 .TP
 .B charset
 the printable-ASCII characters the streams are made of.
@@ -118,6 +139,15 @@ The user and group privileges are dropped to remain compile-time settings in
 
 .IP "\-v"
 print version information to the standard output and exit.
+
+.IP "\-b [<frames>]"
+run a headless render benchmark: build the renderer and one simulation from
+the loaded configuration, render <frames> frames (default 1000) into an
+off-screen buffer, and print the mean milliseconds per frame and peak
+resident set size. No display server connection is made and no privileges
+are required. The buffer size defaults to 1920x1080 and can be overridden
+with the \fIMATLOCK_BENCH_SIZE\fP environment variable (for example
+\fI3840x2160\fP).
 
 \"------------------------------------------------------------------------------
 

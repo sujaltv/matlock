@@ -7,8 +7,10 @@
 /* default charset for the raining characters */
 #define MATRIX_CHARS "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789~`!@#$%^&*()_+-=[]{}\\;:'\",<.>/?"
 
-/* one simulation step per this many microseconds */
-#define UPDATE_INTERVAL 10042
+/* the historical implicit tick rate (1e6 / 10042 us == 99.6 Hz); the
+ * per-second visual behaviour is anchored to this so that any configured
+ * fps looks identical in velocity, spawn density and mutation rate */
+#define RAIN_REF_HZ 100
 
 #include <cstdint>
 #include <string>
@@ -59,7 +61,8 @@ struct RainParams {
     int depth_levels = 4;
     int max_droplets = 1000;
     int droplet_length = 50;            // longest stream, in characters
-    int spawn_attempts = 2;             // spawn attempts per step, 1-in-5 each
+    int spawn_attempts = 1;             // spawn attempts per step, 1-in-5 each
+    int fps = 20;                       // simulation/redraw rate (10..120)
     std::string charset = MATRIX_CHARS;
 
     bool operator==(const RainParams&) const = default;
@@ -78,6 +81,12 @@ struct Rain {
         int active_count = 0;               // Number of active droplets
         int free_head = -1;                 // Head of free-list (-1 = empty)
         uint32_t rng_state = 1;             // xorshift32 PRNG state
+
+        /* per-tick thresholds derived from p.fps so the per-second look is
+         * anchored to RAIN_REF_HZ regardless of the configured frame rate */
+        int speed_jitter = 2;               // extra head speed: fast_rand % this
+        int spawn_mod = 500;                // spawn when fast_rand % this < RAIN_REF_HZ
+        int mutate_threshold = 2;           // mutate when (rnd & 0x1F) < this
 
         /* size everything for the given parameters and reset the free-list */
         void configure(const RainParams& params, uint32_t seed);

@@ -5,13 +5,16 @@
 #define X11_BACKEND_HPP__
 
 #include <X11/Xlib.h>
+#include <X11/extensions/XShm.h>
 #include <memory>
+#include <sys/time.h>
 #include <vector>
 
 #include "auth.hpp"
 #include "backend.hpp"
 #include "conf.hpp"
 #include "rain.hpp"
+#include "render.hpp"
 
 
 struct XRRBaseCodes {
@@ -21,48 +24,57 @@ struct XRRBaseCodes {
 };
 
 
+class X11Backend;
+
+
 struct Monitor {
     public:
         /* serial number of this monitor */
-        int screen_num;
+        int screen_num = 0;
 
-        /* parent window */
-        Window parent;
+        /* parent (root) window and the lock window */
+        Window parent = 0;
+        Window win = 0;
 
-        /* window */
-        Window win;
+        /* invisible cursor bitmap */
+        Pixmap cursor_pixmap = 0;
 
-        /* pixmap */
-        Pixmap pixmap;
-
-        /* possible colours for the monitor */
-        unsigned long colours[States::NUMSTATES];
+        /* window background pixel (shown before the first frame) */
+        unsigned long bg_pixel = 0;
 
         /* rain simulation state */
         struct Rain rain;
 
-        /* X11 rendering resources for the rain (sized to depth_levels) */
-        std::vector<XFontStruct*> font;
-        std::vector<GC> gc;
-        Pixmap backbuffer;
-        std::vector<unsigned long> body_colour[States::NUMSTATES];
-        std::vector<unsigned long> head_colour[States::NUMSTATES];
+        /* presentation: a client-side image (MIT-SHM when available, else a
+         * heap XImage) blitted straight to the window, plus a plain GC */
+        GC gc = 0;
+        XImage* image = nullptr;
+        XShmSegmentInfo shminfo = {};
+        bool shm_active = false;            // this image is a shared segment
+        bool busy = false;                  // awaiting ShmCompletion
+        struct timeval busy_since = {};     // when the in-flight put started
+        int img_w = 0, img_h = 0;
 
-        /* initialise rain resources for this monitor */
-        void init_rain(Display*, const Config&);
+        /* channel packing for the window's visual; a remap pass runs only
+         * when it differs from the usual 0xFF0000/0xFF00/0xFF layout */
+        bool needs_remap = false;
+        int red_shift = 16, green_shift = 8, blue_shift = 0;
+        unsigned long red_mask = 0xFF0000, green_mask = 0xFF00, blue_mask = 0xFF;
 
-        /* re-apply a hot-reloaded configuration */
-        void apply_config(Display*, const Config&, int current_state);
+        /* configure the rain and create the presentation image */
+        void init(Display*, X11Backend*, const Config&);
 
-        /* draw the current simulation state to the window */
-        void draw_rain(Display*, int);
+        /* (re)create the image at the given pixel size */
+        void create_image(Display*, X11Backend*, int w, int h);
 
-        /* free X11 resources */
+        /* render the current simulation state and present it */
+        void draw(Display*, Renderer&, int state);
+
+        /* free the presentation image */
+        void destroy_image(Display*);
+
+        /* free all X11 resources */
         void cleanup(Display*);
-
-    private:
-        /* (re)load fonts, GCs, metrics and colour tables from the config */
-        void setup_rain_resources(Display*, const Config&);
 };
 
 
@@ -80,6 +92,13 @@ class X11Backend : public Backend {
         /* XRandr base codes */
         struct XRRBaseCodes rr;
 
+        /* shared software renderer (font, colours, atlases) */
+        Renderer renderer;
+
+        /* MIT-SHM availability and its completion-event base */
+        bool shm_available = false;
+        int shm_event_base = 0;
+
         explicit X11Backend(Conf& conf);
         ~X11Backend() override;
 
@@ -90,7 +109,14 @@ class X11Backend : public Backend {
     private:
         Conf& conf_;
 
+        /* pacing and idle state */
+        int fps_ = 30;
+        int idle_timeout_ = 120;
+        bool paused_ = false;
+        struct timeval last_input_ = {};
+
         std::unique_ptr<Monitor> lock_screen(int);
+        void note_input(int state);
 };
 
 

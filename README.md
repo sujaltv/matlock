@@ -57,7 +57,7 @@ Key             Default      Purpose
 --------------  -----------  ---------------------------------------
 background      "#141D1A"    background colour
 font_pattern    monospace    fontconfig pattern for the rain glyphs
-                             (Wayland only; X11 uses core fonts)
+                             (both backends)
 font_size       20           pixel size of the closest rain layer
                              (10..128); farther layers interpolate
                              linearly down to 10
@@ -66,8 +66,18 @@ depth_levels    4            number of depth layers (1..8); closer
                              and longer
 max_droplets    1000         size of the droplet pool (16..20000)
 droplet_length  50           longest stream in characters (2..200)
-spawn_attempts  2            spawn attempts per simulation step
-                             (1..32), 1-in-5 chance each
+spawn_attempts  1            spawn attempts per simulation step
+                             (1..32), 1-in-5 chance each; main
+                             rain-density knob
+fps             20           animation frame rate (10..120); the
+                             simulation is rescaled so on-screen
+                             speed is identical at any rate
+idle_timeout    0            seconds without input before the
+                             animation freezes at ~0% CPU (0..86400,
+                             0 disables, the default)
+hidpi           true         render at full buffer scale on HiDPI
+                             outputs; false upscales from scale 1
+                             (Wayland only)
 charset         A-Z 0-9 …    characters the streams are made of
                              (printable ASCII)
 mutate_chars    true         characters in falling columns mutate

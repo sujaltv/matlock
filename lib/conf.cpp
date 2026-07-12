@@ -132,6 +132,12 @@ void set_key(Config& c, bool in_fontcolour, const std::string& key,
         set_int(c.droplet_length, v, 2, 200, path, line);
     } else if (key == "spawn_attempts") {
         set_int(c.spawn_attempts, v, 1, 32, path, line);
+    } else if (key == "fps") {
+        set_int(c.fps, v, 10, 120, path, line);
+    } else if (key == "idle_timeout") {
+        set_int(c.idle_timeout, v, 0, 86400, path, line);
+    } else if (key == "hidpi") {
+        set_bool(c.hidpi, v, path, line);
     } else if (key == "charset") {
         std::string filtered;
         for (char ch : v)

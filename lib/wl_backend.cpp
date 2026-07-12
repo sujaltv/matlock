@@ -9,8 +9,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <array>
-#include <map>
 #include <memory>
 #include <vector>
 
@@ -22,47 +20,16 @@
 
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
-#include <fontconfig/fontconfig.h>
-#include <ft2build.h>
-#include FT_FREETYPE_H
 
 #include "ext-session-lock-v1.h"
 
 #include "../include/wl_backend.hpp"
 #include "../include/rain.hpp"
+#include "../include/render.hpp"
 #include "../include/utils.hpp"
 
 
 namespace {
-
-/* an 8-bit coverage bitmap for one rasterised character */
-struct Glyph {
-    int w = 0, h = 0;
-    int left = 0, top = 0;              // bearings relative to the baseline
-    std::vector<uint8_t> cov;
-};
-
-/* the charset rasterised at every depth size, for one buffer scale */
-struct Atlas {
-    std::vector<DepthMetrics> metrics;              // sized depth_levels
-    std::vector<std::array<Glyph, 128>> glyphs;     // [depth][ASCII char]
-};
-
-
-uint32_t parse_hex(const char* hex) {
-    /* parse a "#RRGGBB" string into 0x00RRGGBB */
-    unsigned int r = 0, g = 0, b = 0;
-    sscanf(hex + 1, "%02x%02x%02x", &r, &g, &b);
-    return (r << 16) | (g << 8) | b;
-}
-
-uint32_t dim(uint32_t rgb, float alpha) {
-    /* scale each channel; on an opaque background this equals alpha blending */
-    uint32_t r = (uint32_t)(((rgb >> 16) & 0xFF) * alpha);
-    uint32_t g = (uint32_t)(((rgb >> 8) & 0xFF) * alpha);
-    uint32_t b = (uint32_t)((rgb & 0xFF) * alpha);
-    return (r << 16) | (g << 8) | b;
-}
 
 long elapsed_us(const struct timespec& from, const struct timespec& to) {
     return (to.tv_sec - from.tv_sec) * 1000000L +
@@ -114,28 +81,31 @@ struct WlBackend::Impl {
     bool repeat_armed = false;
 
     /* rendering */
-    uint32_t background = 0xFF000000;
-    bool render_ready = false;          // atlases and colour tables built
-    std::map<int, Atlas> atlases;       // keyed by integer buffer scale
-    FT_Library ft = nullptr;
-    FT_Face face = nullptr;
-    std::vector<uint32_t> body_colour[States::NUMSTATES];
-    std::vector<uint32_t> head_colour[States::NUMSTATES];
-    std::vector<int> font_sizes;
-    std::string applied_pattern;        // pattern the current face came from
-    int applied_size = 0;
-    RainParams applied_rain;            // structural params the rains use
-
-    Auth* auth = nullptr;
+    Renderer renderer;
+    bool render_ready = false;          // renderer configured, run() started
     bool mutate_chars = false;
 
+    /* pacing: a dedicated timerfd steps and redraws at the configured fps,
+     * decoupled from the monitor refresh; the animation freezes after
+     * idle_timeout seconds without input */
+    int anim_timerfd = -1;
+    int fps = 30;
+    int idle_timeout = 120;
+    bool hidpi = true;
+    struct timespec last_input = {};
+    bool paused = false;
+
+    Auth* auth = nullptr;
+
     void create_lock_surface(WlOutput* out);
-    void render_and_commit(WlOutput* out, bool want_frame);
-    void on_frame(WlOutput* out);
-    const Atlas& atlas_for(int scale);
-    bool init_fonts(const char* pattern);
+    void render_and_commit(WlOutput* out, int steps = 0);
     void apply_config();
     void handle_key_press(uint32_t key, bool from_repeat);
+    void note_input();
+    void arm_anim();
+    void disarm_anim();
+    void evict_unused_atlases();
+    int output_scale(WlOutput* out) const;
     void arm_repeat(uint32_t key);
     void disarm_repeat();
     void remove_output(uint32_t global_name);
@@ -170,9 +140,7 @@ struct WlOutput {
     /* animation */
     Rain rain;
     bool rain_ready = false;
-    wl_callback* frame_cb = nullptr;
-    struct timespec last_step = {};
-    int last_drawn_state = -1;
+    int last_scale = -1;                // buffer scale of the built atlas
 
     void destroy_buffers() {
         for (int i = 0; i < 2; i++) {
@@ -195,8 +163,6 @@ struct WlOutput {
     }
 
     ~WlOutput() {
-        if (this->frame_cb)
-            wl_callback_destroy(this->frame_cb);
         if (this->lock_surface)
             ext_session_lock_surface_v1_destroy(this->lock_surface);
         if (this->surface)
@@ -276,268 +242,76 @@ static bool ensure_buffers(WlBackend::Impl* impl, WlOutput* out, int bw, int bh)
 /* ------------------------------------------------------------------ */
 /* rendering                                                           */
 
-static void blit_glyph(uint32_t* px, int bw, int bh, const Glyph& g,
-                       int ox, int oy, uint32_t col) {
-    /* (ox, oy) is the baseline origin, as with XDrawString. The channel
-     * maths must be signed: a dimmer glyph over a brighter pixel makes
-     * (r - dr) negative. */
-    int x0 = ox + g.left;
-    int y0 = oy - g.top;
-    int r = (col >> 16) & 0xFF, gr = (col >> 8) & 0xFF, b = col & 0xFF;
-
-    for (int row = 0; row < g.h; row++) {
-        int y = y0 + row;
-        if (y < 0 || y >= bh) continue;
-        const uint8_t* src = &g.cov[(size_t)row * g.w];
-        uint32_t* dst = px + (size_t)y * bw;
-        for (int cx = 0; cx < g.w; cx++) {
-            int x = x0 + cx;
-            if (x < 0 || x >= bw) continue;
-            int cov = src[cx];
-            if (!cov) continue;
-            uint32_t d = dst[x];
-            int dr = (d >> 16) & 0xFF, dg = (d >> 8) & 0xFF, db = d & 0xFF;
-            dst[x] = 0xFF000000
-                   | ((uint32_t)(dr + (r - dr) * cov / 255) << 16)
-                   | ((uint32_t)(dg + (gr - dg) * cov / 255) << 8)
-                   |  (uint32_t)(db + (b - db) * cov / 255);
-        }
-    }
+int WlBackend::Impl::output_scale(WlOutput* out) const {
+    /* buffer scale actually used: the output's scale on compositor v3+,
+     * unless hidpi rendering is disabled, in which case render at scale 1
+     * and let the compositor upscale */
+    return (this->compositor_version >= 3 && this->hidpi) ? out->scale : 1;
 }
 
 
-static void draw_rain(WlBackend::Impl* impl, WlOutput* out, uint32_t* px,
-                      const Atlas& atlas, int state) {
-    /* body pass then head pass per depth, exactly as the X11 backend */
-    for (int d = 0; d < out->rain.p.depth_levels; d++) {
-        int dch = atlas.metrics[d].char_height;
-
-        uint32_t body = impl->body_colour[state][d];
-        for (int ai = 0; ai < out->rain.active_count; ai++) {
-            int i = out->rain.active_list[ai];
-            const Droplet& drop = out->rain.droplets[i];
-            if (drop.depth != d) continue;
-            const char* dc = out->rain.droplet_chars(i);
-            for (int j = 1; j < drop.length; j++) {
-                int y = drop.y - (j * dch);
-                if (y < 0 || y > out->buf_h) continue;
-                blit_glyph(px, out->buf_w, out->buf_h,
-                           atlas.glyphs[d][(unsigned char)dc[j] & 0x7F],
-                           drop.x, y, body);
-            }
-        }
-
-        uint32_t head = impl->head_colour[state][d];
-        for (int ai = 0; ai < out->rain.active_count; ai++) {
-            int i = out->rain.active_list[ai];
-            const Droplet& drop = out->rain.droplets[i];
-            if (drop.depth != d) continue;
-            if (drop.y >= 0 && drop.y <= out->buf_h) {
-                blit_glyph(px, out->buf_w, out->buf_h,
-                           atlas.glyphs[d][(unsigned char)out->rain.droplet_chars(i)[0] & 0x7F],
-                           drop.x, drop.y, head);
-            }
-        }
-    }
-}
-
-
-/* wl_callback (frame) */
-static void frame_done(void* data, wl_callback* cb, uint32_t);
-static const wl_callback_listener frame_listener = { frame_done };
-
-static void frame_done(void* data, wl_callback* cb, uint32_t) {
-    auto* out = static_cast<WlOutput*>(data);
-    wl_callback_destroy(cb);
-    out->frame_cb = nullptr;
-    out->impl->on_frame(out);
-}
-
-
-void WlBackend::Impl::render_and_commit(WlOutput* out, bool want_frame) {
+void WlBackend::Impl::render_and_commit(WlOutput* out, int steps) {
     /**
-     * Draw the current content (background, plus rain once run() initialised
-     * rendering) into a free buffer and commit it. Called only after the
-     * first configure was acked. If both buffers are busy the commit still
-     * happens so a requested frame callback keeps the animation alive.
+     * Advance the simulation `steps` ticks, draw into a free buffer, and
+     * commit. Pacing and occlusion are driven purely by the shm buffer
+     * release protocol, not by frame callbacks: a surface the compositor is
+     * displaying releases its previous buffer promptly, so a free buffer is
+     * available every tick; an output that is off (DPMS/blanked) stops
+     * releasing, both buffers stay busy, and the output is left frozen with
+     * no simulation step until it resumes. This cannot deadlock across a
+     * display sleep, unlike a frame-callback gate whose callback the
+     * compositor may never deliver.
      */
 
     if (!out->configured)
         return;
 
-    int sc = (this->compositor_version >= 3) ? out->scale : 1;
+    int sc = this->output_scale(out);
     int bw = (int)out->width * sc;
     int bh = (int)out->height * sc;
 
-    if (want_frame && !out->frame_cb) {
-        out->frame_cb = wl_surface_frame(out->surface);
-        wl_callback_add_listener(out->frame_cb, &frame_listener, out);
-    }
+    if (!ensure_buffers(this, out, bw, bh))
+        return;
 
-    if (ensure_buffers(this, out, bw, bh)) {
-        int bi = !out->busy[0] ? 0 : (!out->busy[1] ? 1 : -1);
-        if (bi >= 0) {
-            uint32_t* px = (uint32_t*)((char*)out->shm_data +
-                                       (size_t)bi * out->buf_w * 4 * out->buf_h);
-            std::fill_n(px, (size_t)out->buf_w * out->buf_h, this->background);
+    int bi = !out->busy[0] ? 0 : (!out->busy[1] ? 1 : -1);
+    if (bi < 0)
+        return;                 // both buffers in flight: output off/occluded
 
-            if (this->render_ready) {
-                const Atlas& atlas = this->atlas_for(sc);
-                if (!out->rain_ready) {
-                    out->rain.configure(this->applied_rain, (uint32_t)rand());
-                    clock_gettime(CLOCK_MONOTONIC, &out->last_step);
-                    out->rain_ready = true;
-                }
-                out->rain.metrics = atlas.metrics;
-                int state = this->auth ? this->auth->state() : States::INIT;
-                draw_rain(this, out, px, atlas, state);
-                out->last_drawn_state = state;
-            }
+    uint32_t* px = (uint32_t*)((char*)out->shm_data +
+                               (size_t)bi * out->buf_w * 4 * out->buf_h);
 
-            if (this->compositor_version >= 3)
-                wl_surface_set_buffer_scale(out->surface, sc);
-            wl_surface_attach(out->surface, out->buffers[bi], 0, 0);
-            wl_surface_damage_buffer(out->surface, 0, 0, INT32_MAX, INT32_MAX);
-            out->busy[bi] = true;
+    if (this->render_ready) {
+        if (!out->rain_ready) {
+            out->rain.configure(this->renderer.rain_params(), (uint32_t)rand());
+            out->rain_ready = true;
         }
+        /* keep the simulation's metrics in step with the atlas at this scale
+         * (droplet deactivation uses char_height) */
+        out->rain.metrics = this->renderer.atlas_for(sc).metrics;
+        out->last_scale = sc;
+        for (int s = 0; s < steps; s++)
+            out->rain.step(out->buf_w, out->buf_h, this->mutate_chars);
+        int state = this->auth ? this->auth->state() : States::INIT;
+        this->renderer.draw(out->rain, px, out->buf_w, out->buf_h, sc, state);
+    } else {
+        std::fill_n(px, (size_t)out->buf_w * out->buf_h,
+                    this->renderer.background());
     }
 
+    if (this->compositor_version >= 3)
+        wl_surface_set_buffer_scale(out->surface, sc);
+    wl_surface_attach(out->surface, out->buffers[bi], 0, 0);
+    wl_surface_damage_buffer(out->surface, 0, 0, out->buf_w, out->buf_h);
+    out->busy[bi] = true;
     wl_surface_commit(out->surface);
 }
 
 
-void WlBackend::Impl::on_frame(WlOutput* out) {
-    /**
-     * Frame-callback driven animation: run the simulation for however many
-     * UPDATE_INTERVALs elapsed (capped to absorb stalls), then redraw.
-     */
-
-    if (!this->render_ready || !out->configured || !out->rain_ready) {
-        this->render_and_commit(out, true);
-        return;
-    }
-
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    long elapsed = elapsed_us(out->last_step, now);
-    long steps = elapsed / UPDATE_INTERVAL;
-
-    if (steps > 5) {
-        /* stalled (e.g. output off): drop the backlog */
-        steps = 5;
-        out->last_step = now;
-    } else {
-        long consumed = steps * UPDATE_INTERVAL;
-        out->last_step.tv_nsec += (consumed % 1000000) * 1000;
-        out->last_step.tv_sec += consumed / 1000000 +
-                                 out->last_step.tv_nsec / 1000000000;
-        out->last_step.tv_nsec %= 1000000000;
-    }
-
-    for (long s = 0; s < steps; s++)
-        out->rain.step(out->buf_w, out->buf_h, this->mutate_chars);
-
-    int state = this->auth ? this->auth->state() : States::INIT;
-    if (steps == 0 && state == out->last_drawn_state) {
-        /* nothing changed: keep the callback chain alive without drawing */
-        if (!out->frame_cb) {
-            out->frame_cb = wl_surface_frame(out->surface);
-            wl_callback_add_listener(out->frame_cb, &frame_listener, out);
-        }
-        wl_surface_commit(out->surface);
-        return;
-    }
-
-    this->render_and_commit(out, true);
-}
-
-
-const Atlas& WlBackend::Impl::atlas_for(int scale) {
-    auto it = this->atlases.find(scale);
-    if (it != this->atlases.end())
-        return it->second;
-
-    int n = this->applied_rain.depth_levels;
-    Atlas& atlas = this->atlases[scale];
-    atlas.metrics.resize(n);
-    atlas.glyphs.resize(n);
-    for (int d = 0; d < n; d++) {
-        if (FT_Set_Pixel_Sizes(this->face, 0, this->font_sizes[d] * scale))
-            Utils::die("%s: FT_Set_Pixel_Sizes failed\n", NAME);
-
-        /* the face is monospaced: use a reference glyph for the advance */
-        if (FT_Load_Char(this->face, 'M', FT_LOAD_RENDER))
-            Utils::die("%s: FT_Load_Char failed\n", NAME);
-        atlas.metrics[d].char_width = (int)(this->face->glyph->advance.x >> 6);
-        atlas.metrics[d].char_height =
-            (int)((this->face->size->metrics.ascender -
-                   this->face->size->metrics.descender) >> 6);
-
-        for (unsigned char ch : this->applied_rain.charset) {
-            if (FT_Load_Char(this->face, ch, FT_LOAD_RENDER))
-                continue;
-            const FT_Bitmap& bm = this->face->glyph->bitmap;
-            Glyph& g = atlas.glyphs[d][ch & 0x7F];
-            g.w = (int)bm.width;
-            g.h = (int)bm.rows;
-            g.left = this->face->glyph->bitmap_left;
-            g.top = this->face->glyph->bitmap_top;
-            g.cov.resize((size_t)g.w * g.h);
-            for (int row = 0; row < g.h; row++)
-                memcpy(&g.cov[(size_t)row * g.w],
-                       bm.buffer + (size_t)row * bm.pitch, g.w);
-        }
-    }
-    return atlas;
-}
-
-
-bool WlBackend::Impl::init_fonts(const char* pattern) {
-    /**
-     * Resolve a fontconfig pattern to a font file and load its face,
-     * replacing the current one. Returns false (keeping the current face)
-     * on failure, so a bad hot-reloaded pattern never kills the locker.
-     */
-
-    FcPattern* pat = FcNameParse((const FcChar8*)pattern);
-    if (!pat) {
-        fprintf(stderr, "%s: cannot parse font pattern '%s'\n", NAME, pattern);
-        return false;
-    }
-    FcConfigSubstitute(NULL, pat, FcMatchPattern);
-    FcDefaultSubstitute(pat);
-    FcResult res;
-    FcPattern* match = FcFontMatch(NULL, pat, &res);
-    FcPatternDestroy(pat);
-    if (!match) {
-        fprintf(stderr, "%s: no font matches '%s'\n", NAME, pattern);
-        return false;
-    }
-
-    FcChar8* file = NULL;
-    if (FcPatternGetString(match, FC_FILE, 0, &file) != FcResultMatch) {
-        fprintf(stderr, "%s: matched font has no file\n", NAME);
-        FcPatternDestroy(match);
-        return false;
-    }
-
-    if (!this->ft && FT_Init_FreeType(&this->ft)) {
-        fprintf(stderr, "%s: FT_Init_FreeType failed\n", NAME);
-        FcPatternDestroy(match);
-        return false;
-    }
-    FT_Face nface = nullptr;
-    if (FT_New_Face(this->ft, (const char*)file, 0, &nface)) {
-        fprintf(stderr, "%s: FT_New_Face %s failed\n", NAME, (const char*)file);
-        FcPatternDestroy(match);
-        return false;
-    }
-    FcPatternDestroy(match);
-
-    if (this->face)
-        FT_Done_Face(this->face);
-    this->face = nface;
-    return true;
+void WlBackend::Impl::evict_unused_atlases() {
+    std::vector<int> keep;
+    for (auto& out : this->outputs)
+        keep.push_back(this->output_scale(out.get()));
+    this->renderer.evict_atlases(keep);
 }
 
 
@@ -553,48 +327,62 @@ void WlBackend::Impl::apply_config() {
     if (this->auth)
         this->auth->set_failonclear(c.failonclear);
 
-    bool rebuild = false;
+    bool fps_changed = (c.fps != this->fps);
+    this->fps = c.fps;
+    this->idle_timeout = c.idle_timeout;
+    this->hidpi = c.hidpi;
 
     RainParams np = rain_params(c);
-    if (!(np == this->applied_rain)) {
-        this->applied_rain = np;
-        /* structural change: restart the simulations */
-        for (auto& out : this->outputs) {
+    bool structural = !(np == this->renderer.rain_params());
+
+    this->renderer.configure(c);
+
+    if (structural) {
+        /* restart the simulations with the new structural parameters */
+        for (auto& out : this->outputs)
             if (out->rain_ready)
                 out->rain.configure(np, (uint32_t)rand());
-        }
-        rebuild = true;
     }
 
-    int n = this->applied_rain.depth_levels;
-    this->background = 0xFF000000 | parse_hex(c.background.c_str());
-    for (int st = 0; st < States::NUMSTATES; st++) {
-        uint32_t rgb = parse_hex(c.fontcolour[st].c_str());
-        this->body_colour[st].resize(n);
-        this->head_colour[st].resize(n);
-        for (int d = 0; d < n; d++) {
-            float a = sample_curve(DEPTH_ALPHA_CURVE, n, d);
-            this->body_colour[st][d] = dim(rgb, a);
-            this->head_colour[st][d] = dim(rgb, std::min(1.0f, a * 1.3f));
-        }
-    }
+    if (fps_changed && this->render_ready && !this->paused)
+        this->arm_anim();
+    this->evict_unused_atlases();
+}
 
-    if (c.font_pattern != this->applied_pattern) {
-        if (this->init_fonts(c.font_pattern.c_str())) {
-            this->applied_pattern = c.font_pattern;
-            rebuild = true;
-        } else {
-            fprintf(stderr, "%s: keeping font '%s'\n", NAME,
-                    this->applied_pattern.c_str());
-        }
-    }
-    if (c.font_size != this->applied_size) {
-        this->applied_size = c.font_size;
-        rebuild = true;
-    }
-    if (rebuild) {
-        this->font_sizes = depth_font_sizes(this->applied_size, n);
-        this->atlases.clear();
+
+/* ------------------------------------------------------------------ */
+/* pacing and idle                                                     */
+
+void WlBackend::Impl::arm_anim() {
+    if (this->anim_timerfd < 0 || this->fps <= 0)
+        return;
+    struct itimerspec its = {};
+    long interval_ns = 1000000000L / this->fps;
+    its.it_interval.tv_sec = interval_ns / 1000000000L;
+    its.it_interval.tv_nsec = interval_ns % 1000000000L;
+    its.it_value = its.it_interval;
+    timerfd_settime(this->anim_timerfd, 0, &its, NULL);
+}
+
+
+void WlBackend::Impl::disarm_anim() {
+    if (this->anim_timerfd < 0)
+        return;
+    struct itimerspec its = {};
+    timerfd_settime(this->anim_timerfd, 0, &its, NULL);
+}
+
+
+void WlBackend::Impl::note_input() {
+    /* record activity for the idle clock; wake and repaint if the animation
+     * had been frozen (a key press also changes the state colour, which the
+     * repaint reflects immediately) */
+    clock_gettime(CLOCK_MONOTONIC, &this->last_input);
+    if (this->paused) {
+        this->paused = false;
+        this->arm_anim();
+        for (auto& out : this->outputs)
+            this->render_and_commit(out.get());
     }
 }
 
@@ -728,6 +516,7 @@ static void keyboard_key(void* data, wl_keyboard*, uint32_t, uint32_t,
                          uint32_t key, uint32_t state) {
     auto* impl = static_cast<WlBackend::Impl*>(data);
     if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+        impl->note_input();
         impl->handle_key_press(key, false);
     } else if (impl->repeat_armed && key == impl->repeat_key) {
         impl->disarm_repeat();
@@ -786,7 +575,7 @@ static void lock_surface_configure(void* data, ext_session_lock_surface_v1* ls,
     out->height = height;
     ext_session_lock_surface_v1_ack_configure(ls, serial);
     out->configured = true;
-    out->impl->render_and_commit(out, out->impl->render_ready);
+    out->impl->render_and_commit(out);
 }
 
 static const ext_session_lock_surface_v1_listener lock_surface_listener = {
@@ -842,6 +631,9 @@ void WlBackend::Impl::remove_output(uint32_t global_name) {
     for (auto it = this->outputs.begin(); it != this->outputs.end(); ++it) {
         if ((*it)->global_name == global_name) {
             this->outputs.erase(it);
+            /* a scale no other output uses can now be freed */
+            if (this->render_ready)
+                this->evict_unused_atlases();
             return;
         }
     }
@@ -937,6 +729,11 @@ WlBackend::WlBackend(Conf& conf)
     if (impl->repeat_timerfd < 0)
         Utils::die("%s: timerfd_create: %s\n", NAME, strerror(errno));
 
+    impl->anim_timerfd = timerfd_create(CLOCK_MONOTONIC,
+                                        TFD_NONBLOCK | TFD_CLOEXEC);
+    if (impl->anim_timerfd < 0)
+        Utils::die("%s: timerfd_create: %s\n", NAME, strerror(errno));
+
     impl->registry = wl_display_get_registry(impl->display);
     wl_registry_add_listener(impl->registry, &registry_listener, impl);
 
@@ -946,18 +743,18 @@ WlBackend::WlBackend(Conf& conf)
         Utils::die("%s: compositor lacks wl_compositor or wl_shm\n", NAME);
     wl_display_roundtrip(impl->display);
 
-    /* resolve the rain font now, while fontconfig still sees the invoking
-     * user's configuration (privileges are dropped before run()) */
+    /* resolve the rain font and build the colour tables now, while fontconfig
+     * still sees the invoking user's configuration (privileges are dropped
+     * before run()) */
     const Config& c = conf.cfg();
-    if (!impl->init_fonts(c.font_pattern.c_str()))
+    impl->fps = c.fps;
+    impl->idle_timeout = c.idle_timeout;
+    impl->hidpi = c.hidpi;
+    impl->renderer.configure(c);
+    if (!impl->renderer.has_face())
         Utils::die("%s: no usable font for pattern '%s'\n", NAME,
                    c.font_pattern.c_str());
-    impl->applied_pattern = c.font_pattern;
-    impl->applied_size = c.font_size;
-    impl->applied_rain = rain_params(c);
-    impl->font_sizes = depth_font_sizes(impl->applied_size,
-                                        impl->applied_rain.depth_levels);
-    impl->apply_config();
+    impl->mutate_chars = c.mutate_chars;
 }
 
 
@@ -990,11 +787,8 @@ WlBackend::~WlBackend() {
         xkb_context_unref(impl->xkb_ctx);
     if (impl->repeat_timerfd >= 0)
         close(impl->repeat_timerfd);
-
-    if (impl->face)
-        FT_Done_Face(impl->face);
-    if (impl->ft)
-        FT_Done_FreeType(impl->ft);
+    if (impl->anim_timerfd >= 0)
+        close(impl->anim_timerfd);
 }
 
 
@@ -1048,14 +842,17 @@ void WlBackend::run(Auth& auth) {
     impl->apply_config();
     impl->render_ready = true;
 
-    /* first rain frame on every output; keeps animating via frame callbacks */
+    /* start the animation clock and paint the first frame on every output */
+    clock_gettime(CLOCK_MONOTONIC, &impl->last_input);
+    impl->arm_anim();
     for (auto& out : impl->outputs)
-        impl->render_and_commit(out.get(), true);
+        impl->render_and_commit(out.get());
 
-    struct pollfd fds[3] = {
+    struct pollfd fds[4] = {
         { wl_display_get_fd(impl->display), POLLIN, 0 },
         { impl->repeat_timerfd,             POLLIN, 0 },
         { impl->conf->watch_fd(),           POLLIN, 0 },   // -1 is ignored
+        { impl->anim_timerfd,               POLLIN, 0 },
     };
 
     while (!auth.unlocked()) {
@@ -1068,7 +865,7 @@ void WlBackend::run(Auth& auth) {
         }
         wl_display_flush(impl->display);
 
-        if (poll(fds, 3, -1) < 0) {
+        if (poll(fds, 4, -1) < 0) {
             wl_display_cancel_read(impl->display);
             if (errno == EINTR)
                 continue;
@@ -1091,14 +888,42 @@ void WlBackend::run(Auth& auth) {
                 impl->repeat_armed) {
                 if (expirations > 32)
                     expirations = 32;   // absorb stalls
-                while (expirations-- && !auth.unlocked())
+                while (expirations-- && !auth.unlocked()) {
+                    impl->note_input();
                     impl->handle_key_press(impl->repeat_key, true);
+                }
             }
         }
 
         if (fds[2].revents & POLLIN) {
             if (impl->conf->reload_if_changed())
                 impl->apply_config();
+        }
+
+        /* animation tick: step and redraw. render_and_commit skips an output
+         * whose buffers are both in flight (off/occluded) and steps only when
+         * it draws, so a blanked output freezes without drifting and resumes
+         * cleanly when its buffers are released again */
+        if (fds[3].revents & POLLIN) {
+            uint64_t ticks = 0;
+            if (read(impl->anim_timerfd, &ticks, sizeof(ticks)) ==
+                    sizeof(ticks) && ticks > 0) {
+                if (ticks > 5)
+                    ticks = 5;          // drop the backlog after a stall
+                for (auto& out : impl->outputs)
+                    impl->render_and_commit(out.get(), (int)ticks);
+            }
+        }
+
+        /* freeze the animation after idle_timeout seconds without input */
+        if (impl->idle_timeout > 0 && !impl->paused) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (elapsed_us(impl->last_input, now) >=
+                    (long)impl->idle_timeout * 1000000L) {
+                impl->paused = true;
+                impl->disarm_anim();
+            }
         }
     }
 
