@@ -32,7 +32,7 @@ struct Config {
     int         max_droplets   = 1000;
     int         droplet_length = 50;
     int         spawn_attempts = 1;
-    int         fps            = 20;
+    int         fps            = 30;
     std::vector<char32_t> charset = default_charset();
 
     /* pacing and resource behaviour */
