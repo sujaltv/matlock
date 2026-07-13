@@ -92,6 +92,8 @@ static int run_benchmark(const Config& cfg, int frames) {
     rain.metrics = renderer.atlas_for(1).metrics;
 
     std::vector<uint32_t> px((size_t)w * h);
+    RenderTarget target;
+    std::vector<DirtyRect> damage;
 
     /* warm up so the droplet field is populated before timing */
     for (int i = 0; i < 300; i++)
@@ -101,7 +103,7 @@ static int run_benchmark(const Config& cfg, int frames) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (int f = 0; f < frames; f++) {
         rain.step(w, h, cfg.mutate_chars);
-        renderer.draw(rain, px.data(), w, h, 1, States::INIT);
+        renderer.draw(rain, px.data(), w, h, 1, States::INIT, target, damage);
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
 
@@ -118,41 +120,55 @@ static int run_benchmark(const Config& cfg, int frames) {
 }
 
 
-const char* get_user_hash() {
+struct TargetIds {
+    uid_t uid;
+    gid_t gid;
+};
+
+
+static TargetIds lookup_drop_target() {
+    /**
+     * Resolve the unprivileged user and group to drop to. Looked up before
+     * any privileges are shed so a bad name fails fast.
+     */
+
 	struct passwd *pwd;
 	struct group *grp;
-	uid_t duid;
-	gid_t dgid;
-    const char* hash;
 
+	errno = 0;
 	if (!(pwd = getpwnam(user)))
 		Utils::die("%s: getpwnam %s: %s\n", NAME, user,
 		    errno ? strerror(errno) : "user entry not found");
-	duid = pwd->pw_uid;
 	errno = 0;
 	if (!(grp = getgrnam(group)))
 		Utils::die("%s: getgrnam %s: %s\n", NAME, group,
 		    errno ? strerror(errno) : "group entry not found");
-	dgid = grp->gr_gid;
+	return TargetIds{pwd->pw_uid, grp->gr_gid};
+}
 
-    #ifdef __linux__
-	    dont_kill_me();
-    #endif
 
-	hash = Utils::get_hash();
-	errno = 0;
-	if (!crypt("", hash))
-		Utils::die("%s: crypt: %s\n", NAME, strerror(errno));
+static void drop_privileges(uid_t uid, gid_t gid) {
+    /**
+     * Permanently drop to uid:gid. The effective uid may have been switched
+     * to the invoking user (see main), so the saved euid 0 is regained first;
+     * without privileges that fails, which is fine as long as the target is
+     * the invoking user already (the unprivileged benchmark path).
+     */
 
-	/* drop privileges */
+	if (geteuid() != 0)
+		seteuid(0);
+	if (geteuid() != 0) {
+		if (getuid() == uid)
+			return;                 // nothing runs elevated, nothing to drop
+		Utils::die("%s: cannot drop to uid %d without privileges\n", NAME,
+		    (int)uid);
+	}
 	if (setgroups(0, NULL) < 0)
 		Utils::die("%s: setgroups: %s\n", NAME, strerror(errno));
-	if (setgid(dgid) < 0)
+	if (setgid(gid) < 0)
 		Utils::die("%s: setgid: %s\n", NAME, strerror(errno));
-	if (setuid(duid) < 0)
+	if (setuid(uid) < 0)
 		Utils::die("%s: setuid: %s\n", NAME, strerror(errno));
-
-    return hash;
 }
 
 
@@ -182,17 +198,40 @@ int main(int argc, char* argv[]) {
             usage();
 	} ARGEND
 
+    /* headless render benchmark: it only parses configuration and fonts, so
+     * it never runs with privileges */
+    if (bench) {
+        drop_privileges(getuid(), getgid());
+        Conf conf;
+        return run_benchmark(conf.cfg(), bench_frames);
+    }
+
+    /* the work that needs euid 0 (a suid install) happens first: the OOM
+     * adjust and the shadow hash */
+    TargetIds target = lookup_drop_target();
+    #ifdef __linux__
+        dont_kill_me();
+    #endif
+    hash = Utils::get_hash();
+    errno = 0;
+    if (!crypt("", hash))
+        Utils::die("%s: crypt: %s\n", NAME, strerror(errno));
+
+    /* Everything from here on parses input the invoking user controls: the
+     * configuration files, fontconfig's lookup (FONTCONFIG_FILE, user font
+     * dirs), FreeType's font parsing and the display protocol. None of that
+     * may run with euid 0, so switch to the invoking user now; the saved
+     * euid 0 is kept for the permanent drop below. */
+    if (geteuid() == 0 && getuid() != 0 && seteuid(getuid()) < 0)
+        Utils::die("%s: seteuid: %s\n", NAME, strerror(errno));
+
     /* load /etc/matlock.yaml and the per-user override, and watch both for
      * live changes */
     Conf conf;
 
-    /* headless render benchmark: no display server, no privilege drop */
-    if (bench)
-        return run_benchmark(conf.cfg(), bench_frames);
-
-    /* pick the backend from the session environment and connect to the
-     * display server with real credentials, before the privilege drop in
-     * get_user_hash() */
+    /* pick the backend from the session environment; the constructor
+     * connects to the display server and resolves the rain font while
+     * fontconfig still sees the invoking user's configuration */
     std::unique_ptr<Backend> backend;
     if (getenv("WAYLAND_DISPLAY"))
         backend = std::make_unique<WlBackend>(conf);
@@ -201,7 +240,9 @@ int main(int argc, char* argv[]) {
     else
         Utils::die("%s: neither WAYLAND_DISPLAY nor DISPLAY is set\n", NAME);
 
-    hash = get_user_hash();
+    /* fonts and colours are resolved: drop to the unprivileged user for the
+     * lifetime of the lock */
+    drop_privileges(target.uid, target.gid);
 
 	/* did we manage to lock everything? */
 	if (!backend->lock())

@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <sys/mman.h>
 #include <unistd.h>
 #ifdef __linux__
     #include <crypt.h>
@@ -17,11 +18,14 @@
 Auth::Auth(const char* hash, int failonclear)
     : hash_(hash), failonclear_(failonclear) {
     explicit_bzero(&this->passwd_, sizeof(this->passwd_));
+    /* keep the cleartext password off swap; not fatal if it fails */
+    mlock(this->passwd_, sizeof(this->passwd_));
 }
 
 
 Auth::~Auth() {
     explicit_bzero(&this->passwd_, sizeof(this->passwd_));
+    munlock(this->passwd_, sizeof(this->passwd_));
 }
 
 
@@ -54,11 +58,17 @@ void Auth::feed(Key k, const char* utf8, int len) {
         this->failure_ = 0;
         break;
     case Key::Backspace:
-        if (this->len_)
-            this->passwd_[--this->len_] = '\0';
+        /* remove one character, not one byte: strip the UTF-8 continuation
+         * bytes, then the lead byte */
+        while (this->len_) {
+            unsigned char b = (unsigned char)this->passwd_[--this->len_];
+            this->passwd_[this->len_] = '\0';
+            if ((b & 0xC0) != 0x80)
+                break;
+        }
         break;
     case Key::Char:
-        if (len && !iscntrl((int)utf8[0]) &&
+        if (len && !iscntrl((unsigned char)utf8[0]) &&
             (this->len_ + len < sizeof(this->passwd_))) {
             memcpy(this->passwd_ + this->len_, utf8, len);
             this->len_ += len;

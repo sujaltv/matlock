@@ -61,8 +61,12 @@ struct Monitor {
         int red_shift = 16, green_shift = 8, blue_shift = 0;
         unsigned long red_mask = 0xFF0000, green_mask = 0xFF00, blue_mask = 0xFF;
 
+        /* incremental drawing state for the image, plus damage scratch */
+        RenderTarget target;
+        std::vector<DirtyRect> damage;
+
         /* configure the rain and create the presentation image */
-        void init(Display*, X11Backend*, const Config&);
+        void init(Display*, X11Backend*);
 
         /* (re)create the image at the given pixel size */
         void create_image(Display*, X11Backend*, int w, int h);

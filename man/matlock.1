@@ -117,7 +117,18 @@ compositor upscales, cutting CPU and memory on Retina-class outputs at some
 crispness cost (Wayland only).
 .TP
 .B charset
-the printable-ASCII characters the streams are made of.
+the characters the streams are made of (1..1024 of them, written as UTF-8;
+blank and control characters are ignored). Any script may be used: for each
+character the font matched by \fBfont_pattern\fP does not contain,
+\fBfontconfig\fP(1) is asked for a fallback font that does, so
+\fIcharset: कखगघङचछजझञ\fP rains Devanagari even when \fBfont_pattern\fP is a
+Latin-only monospaced font. Characters no installed font can draw are
+reported on standard error and fall as blanks. The cell of the rain grid is
+the widest character in the set, so a script whose characters vary in width,
+or one that mixes narrow and wide characters, spaces the columns more loosely
+than a monospaced Latin set does. Combining marks (Devanagari matras, Arabic
+diacritics, and the like) are not characters that stand on their own and will
+draw on a dotted circle: use base letters only.
 .TP
 .B mutate_chars
 whether characters in the falling columns mutate (true/false).

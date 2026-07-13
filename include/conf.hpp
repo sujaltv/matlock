@@ -33,7 +33,7 @@ struct Config {
     int         droplet_length = 50;
     int         spawn_attempts = 1;
     int         fps            = 20;
-    std::string charset        = MATRIX_CHARS;
+    std::vector<char32_t> charset = default_charset();
 
     /* pacing and resource behaviour */
     int         idle_timeout   = 0;     // seconds; 0 disables the idle pause

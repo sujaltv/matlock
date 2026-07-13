@@ -67,6 +67,68 @@ const char* Utils::get_hash(void) {
 }
 
 
+bool Utils::utf8_decode(const std::string& s, std::vector<char32_t>& out) {
+    /**
+     * Strict UTF-8 decoder: rejects stray continuation bytes, truncated
+     * sequences, overlong encodings, surrogates and anything above U+10FFFF,
+     * so a mangled configuration file can never reach the rasteriser as a
+     * half-formed codepoint.
+     */
+
+    static const char32_t lowest[4] = {0x0, 0x80, 0x800, 0x10000};
+
+    out.clear();
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = (unsigned char)s[i];
+        char32_t cp;
+        int extra;
+
+        if (c < 0x80)                { cp = c;          extra = 0; }
+        else if ((c & 0xE0) == 0xC0) { cp = c & 0x1Fu;  extra = 1; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0Fu;  extra = 2; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07u;  extra = 3; }
+        else                         { out.clear(); return false; }
+
+        if (i + (size_t)extra >= s.size()) {
+            out.clear();
+            return false;
+        }
+        for (int k = 1; k <= extra; k++) {
+            unsigned char cc = (unsigned char)s[i + (size_t)k];
+            if ((cc & 0xC0) != 0x80) {
+                out.clear();
+                return false;
+            }
+            cp = (cp << 6) | (cc & 0x3Fu);
+        }
+        if (cp < lowest[extra] || cp > 0x10FFFF ||
+            (cp >= 0xD800 && cp <= 0xDFFF)) {
+            out.clear();
+            return false;
+        }
+
+        out.push_back(cp);
+        i += (size_t)extra + 1;
+    }
+    return true;
+}
+
+
+bool Utils::printable_codepoint(char32_t cp) {
+    if (cp <= 0x20 || cp == 0x7F)               // C0 controls, space, DEL
+        return false;
+    if (cp >= 0x80 && cp <= 0xA0)               // C1 controls, no-break space
+        return false;
+    if (cp >= 0x2000 && cp <= 0x200F)           // Unicode spaces, zero widths
+        return false;
+    if (cp == 0x2028 || cp == 0x2029)           // line and paragraph separators
+        return false;
+    if (cp == 0x3000 || cp == 0xFEFF)           // ideographic space, BOM
+        return false;
+    return true;
+}
+
+
 int Utils::timingsafe_bcmp(const void* a, const void* b, size_t len) {
 	const volatile unsigned char* p1 = (const volatile unsigned char*) a;
 	const volatile unsigned char* p2 = (const volatile unsigned char*) b;

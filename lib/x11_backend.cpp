@@ -236,18 +236,22 @@ void Monitor::create_image(Display* disp, X11Backend* be, int w, int h) {
     this->img_w = w;
     this->img_h = h;
     this->busy = false;
+    this->target.invalidate();      // fresh pixel storage: force a full clear
 
     if (!this->gc)
         this->gc = XCreateGC(disp, this->win, 0, NULL);
 }
 
 
-void Monitor::init(Display* disp, X11Backend* be, const Config& cfg) {
+void Monitor::init(Display* disp, X11Backend* be) {
     /**
      * Size the simulation and create the presentation image for this monitor.
+     * The simulation takes its parameters from the renderer rather than from
+     * the configuration directly: a droplet's characters are indices into the
+     * charset the renderer resolved fonts for, so the two must never disagree.
      */
 
-    this->rain.configure(rain_params(cfg), (uint32_t)rand());
+    this->rain.configure(be->renderer.rain_params(), (uint32_t)rand());
     int width = DisplayWidth(disp, this->screen_num);
     int height = DisplayHeight(disp, this->screen_num);
     this->create_image(disp, be, width, height);
@@ -277,7 +281,18 @@ void Monitor::draw(Display* disp, Renderer& renderer, int state) {
     }
 
     uint32_t* px = (uint32_t*)this->image->data;
-    renderer.draw(this->rain, px, this->img_w, this->img_h, 1, state);
+
+    /* An off-layout visual takes the full-frame path every time: the remap
+     * is not idempotent, so it cannot run over overlapping damage rects, and
+     * such visuals are rare enough that incremental drawing is not worth a
+     * remap-aware variant. */
+    if (this->needs_remap)
+        this->target.invalidate();
+
+    renderer.draw(this->rain, px, this->img_w, this->img_h, 1, state,
+                  this->target, this->damage);
+    if (this->damage.empty())
+        return;                     // blank frame after a blank frame
 
     if (this->needs_remap) {
         size_t n = (size_t)this->img_w * this->img_h;
@@ -290,14 +305,23 @@ void Monitor::draw(Display* disp, Renderer& renderer, int state) {
         }
     }
 
+    /* present only the bounding box of what changed */
+    int x1 = this->img_w, y1 = this->img_h, x2 = 0, y2 = 0;
+    for (const DirtyRect& r : this->damage) {
+        x1 = std::min(x1, r.x);
+        y1 = std::min(y1, r.y);
+        x2 = std::max(x2, r.x + r.w);
+        y2 = std::max(y2, r.y + r.h);
+    }
+
     if (this->shm_active) {
-        XShmPutImage(disp, this->win, this->gc, this->image, 0, 0, 0, 0,
-                     this->img_w, this->img_h, True);
+        XShmPutImage(disp, this->win, this->gc, this->image, x1, y1, x1, y1,
+                     x2 - x1, y2 - y1, True);
         this->busy = true;
         gettimeofday(&this->busy_since, NULL);
     } else {
-        XPutImage(disp, this->win, this->gc, this->image, 0, 0, 0, 0,
-                  this->img_w, this->img_h);
+        XPutImage(disp, this->win, this->gc, this->image, x1, y1, x1, y1,
+                  x2 - x1, y2 - y1);
     }
     XFlush(disp);
 }
@@ -339,7 +363,7 @@ void X11Backend::run(Auth& auth) {
     struct timeval last_update, current_time;
 
     for (auto& mon : this->monitors)
-        mon->init(this->disp, this, this->conf_.cfg());
+        mon->init(this->disp, this);
 
     int tick_us = 1000000 / this->fps_;
 
@@ -359,10 +383,11 @@ void X11Backend::run(Auth& auth) {
     int xfd = ConnectionNumber(this->disp);
     int wfd = this->conf_.watch_fd();
     fd_set fds;
+    bool conf_ready = true;         // check once at startup, then on wakeups
 
     while (!auth.unlocked()) {
         // Apply configuration changes live
-        if (this->conf_.reload_if_changed()) {
+        if (conf_ready && this->conf_.reload_if_changed()) {
             const Config& cfg = this->conf_.cfg();
             auth.set_failonclear(cfg.failonclear);
             this->fps_ = cfg.fps;
@@ -374,7 +399,8 @@ void X11Backend::run(Auth& auth) {
             this->renderer.configure(cfg);
             for (auto& mon : this->monitors) {
                 if (structural)
-                    mon->rain.configure(np, (uint32_t)rand());
+                    mon->rain.configure(this->renderer.rain_params(),
+                                        (uint32_t)rand());
                 mon->rain.metrics = this->renderer.atlas_for(1).metrics;
             }
             if (!this->paused_) {
@@ -382,6 +408,7 @@ void X11Backend::run(Auth& auth) {
                     mon->draw(this->disp, this->renderer, auth.state());
             }
         }
+        conf_ready = false;
 
         // Process all pending X events
         while (XPending(this->disp)) {
@@ -488,7 +515,8 @@ void X11Backend::run(Auth& auth) {
             FD_SET(xfd, &fds);
             if (wfd >= 0)
                 FD_SET(wfd, &fds);
-            select(std::max(xfd, wfd) + 1, &fds, NULL, NULL, to);
+            if (select(std::max(xfd, wfd) + 1, &fds, NULL, NULL, to) > 0)
+                conf_ready = wfd >= 0 && FD_ISSET(wfd, &fds);
         }
 
         // Freeze the animation after idle_timeout seconds without input

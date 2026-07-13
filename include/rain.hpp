@@ -7,6 +7,10 @@
 /* default charset for the raining characters */
 #define MATRIX_CHARS "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789~`!@#$%^&*()_+-=[]{}\\;:'\",<.>/?"
 
+/* upper bound on the number of characters in a charset; the droplets store an
+ * index into it, so it must stay within a uint16_t */
+#define MAX_CHARSET 1024
+
 /* the historical implicit tick rate (1e6 / 10042 us == 99.6 Hz); the
  * per-second visual behaviour is anchored to this so that any configured
  * fps looks identical in velocity, spawn density and mutation rate */
@@ -55,6 +59,16 @@ static inline uint32_t fast_rand(uint32_t& s) {
 }
 
 
+/* MATRIX_CHARS as codepoints; the literal is ASCII, so the bytes are the
+ * codepoints */
+static inline std::vector<char32_t> default_charset() {
+    std::vector<char32_t> cs;
+    for (const char* p = MATRIX_CHARS; *p; p++)
+        cs.push_back((char32_t)(unsigned char)*p);
+    return cs;
+}
+
+
 /* structural simulation parameters (from the configuration); changing any
  * of these requires Rain::configure */
 struct RainParams {
@@ -63,7 +77,7 @@ struct RainParams {
     int droplet_length = 50;            // longest stream, in characters
     int spawn_attempts = 1;             // spawn attempts per step, 1-in-5 each
     int fps = 20;                       // simulation/redraw rate (10..120)
-    std::string charset = MATRIX_CHARS;
+    std::vector<char32_t> charset = default_charset();
 
     bool operator==(const RainParams&) const = default;
 };
@@ -73,7 +87,11 @@ struct Rain {
     public:
         RainParams p;
         std::vector<Droplet> droplets;
-        std::vector<char> chars;            // p.droplet_length chars per droplet
+        /* p.droplet_length characters per droplet, each held as an index into
+         * p.charset rather than the codepoint itself: the renderer's atlas is
+         * keyed the same way, so drawing is a direct lookup and no character
+         * ever needs decoding on the hot path */
+        std::vector<uint16_t> chars;
         std::vector<int> active_list;       // Indices of active droplets
         std::vector<DepthMetrics> metrics;  // sized p.depth_levels
         std::vector<int> speed_base;        // per-depth base speed
@@ -91,11 +109,11 @@ struct Rain {
         /* size everything for the given parameters and reset the free-list */
         void configure(const RainParams& params, uint32_t seed);
 
-        /* the character stream of droplet i */
-        char* droplet_chars(int i) {
+        /* the character stream of droplet i, as charset indices */
+        uint16_t* droplet_chars(int i) {
             return &this->chars[(size_t)i * this->p.droplet_length];
         }
-        const char* droplet_chars(int i) const {
+        const uint16_t* droplet_chars(int i) const {
             return &this->chars[(size_t)i * this->p.droplet_length];
         }
 

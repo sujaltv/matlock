@@ -139,16 +139,26 @@ void set_key(Config& c, bool in_fontcolour, const std::string& key,
     } else if (key == "hidpi") {
         set_bool(c.hidpi, v, path, line);
     } else if (key == "charset") {
-        std::string filtered;
-        for (char ch : v)
-            if (ch >= 0x21 && ch <= 0x7E)
-                filtered += ch;
-        if (filtered.empty() || filtered.size() > 256)
-            warn(path, line, "invalid charset (1..256 printable ASCII characters)", v);
-        else {
-            if (filtered.size() != v.size())
-                warn(path, line, "charset: ignored non-printable-ASCII characters", v);
-            c.charset = filtered;
+        std::vector<char32_t> cps;
+        if (!Utils::utf8_decode(v, cps)) {
+            warn(path, line, "charset: not valid UTF-8", v);
+        } else {
+            std::vector<char32_t> filtered;
+            for (char32_t cp : cps)
+                if (Utils::printable_codepoint(cp))
+                    filtered.push_back(cp);
+            if (filtered.empty() || filtered.size() > MAX_CHARSET) {
+                char msg[64];
+                snprintf(msg, sizeof(msg),
+                         "invalid charset (1..%d printable characters)",
+                         MAX_CHARSET);
+                warn(path, line, msg, v);
+            } else {
+                if (filtered.size() != cps.size())
+                    warn(path, line, "charset: ignored blank and control "
+                         "characters", v);
+                c.charset = filtered;
+            }
         }
     } else if (key == "mutate_chars") {
         set_bool(c.mutate_chars, v, path, line);

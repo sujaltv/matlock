@@ -94,10 +94,10 @@ void Rain::rain_droplet(int width, int height) {
     drop.active = 1;
     this->active_list[this->active_count++] = idx;
 
-    char* dc = this->droplet_chars(idx);
-    int ncs = (int)this->p.charset.size();
+    uint16_t* dc = this->droplet_chars(idx);
+    uint32_t ncs = (uint32_t)this->p.charset.size();
     for (int j = 0; j < drop.length; j++) {
-        dc[j] = this->p.charset[fast_rand(this->rng_state) % ncs];
+        dc[j] = (uint16_t)(fast_rand(this->rng_state) % ncs);
     }
 }
 
@@ -114,7 +114,7 @@ void Rain::step(int width, int height, bool mutate_chars) {
             this->rain_droplet(width, height);
     }
 
-    int ncs = (int)this->p.charset.size();
+    uint32_t ncs = (uint32_t)this->p.charset.size();
 
     // Update positions, mutate chars, deactivate off-screen droplets
     for (int ai = 0; ai < this->active_count; ai++) {
@@ -136,12 +136,12 @@ void Rain::step(int width, int height, bool mutate_chars) {
 
         // Mutate characters
         if (mutate_chars) {
-            char* dc = this->droplet_chars(i);
+            uint16_t* dc = this->droplet_chars(i);
             uint32_t rnd = fast_rand(this->rng_state);
             int bits_left = 6;
             for (int j = 0; j < drop.length; j++) {
                 if ((int)(rnd & 0x1F) < this->mutate_threshold) {
-                    dc[j] = this->p.charset[fast_rand(this->rng_state) % ncs];
+                    dc[j] = (uint16_t)(fast_rand(this->rng_state) % ncs);
                 }
                 rnd >>= 5;
                 if (--bits_left <= 0) {

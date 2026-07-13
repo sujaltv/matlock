@@ -84,6 +84,7 @@ struct WlBackend::Impl {
     Renderer renderer;
     bool render_ready = false;          // renderer configured, run() started
     bool mutate_chars = false;
+    std::vector<DirtyRect> damage;      // per-frame scratch
 
     /* pacing: a dedicated timerfd steps and redraws at the configured fps,
      * decoupled from the monitor refresh; the animation freezes after
@@ -140,7 +141,13 @@ struct WlOutput {
     /* animation */
     Rain rain;
     bool rain_ready = false;
-    int last_scale = -1;                // buffer scale of the built atlas
+    int last_scale = -1;                // scale the rain metrics came from
+
+    /* incremental drawing: per-buffer ink state, and the ink of the last
+     * committed frame (what the compositor currently shows), which is what
+     * commit damage must be computed against under double buffering */
+    RenderTarget targets[2];
+    std::vector<DirtyRect> last_commit;
 
     void destroy_buffers() {
         for (int i = 0; i < 2; i++) {
@@ -149,7 +156,9 @@ struct WlOutput {
                 this->buffers[i] = nullptr;
             }
             this->busy[i] = false;
+            this->targets[i].invalidate();
         }
+        this->last_commit.clear();
         if (this->pool) {
             wl_shm_pool_destroy(this->pool);
             this->pool = nullptr;
@@ -207,13 +216,23 @@ static bool ensure_buffers(WlBackend::Impl* impl, WlOutput* out, int bw, int bh)
 
     int fd = memfd_create("matlock-shm", MFD_CLOEXEC);
     if (fd < 0) {
-        /* fallback for kernels without memfd */
-        char name[64];
-        snprintf(name, sizeof(name), "/matlock-%d", getpid());
-        fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+        /* Fallback for kernels without memfd. The name must not be
+         * predictable: with O_EXCL, any local process that squats a
+         * predictable name keeps the locker from starting. */
+        for (int attempt = 0; attempt < 16 && fd < 0; attempt++) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            char name[64];
+            snprintf(name, sizeof(name), "/matlock-%d-%ld-%d", getpid(),
+                     ts.tv_nsec, attempt);
+            fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+            if (fd >= 0)
+                shm_unlink(name);
+            else if (errno != EEXIST)
+                break;
+        }
         if (fd < 0)
             Utils::die("%s: shm_open: %s\n", NAME, strerror(errno));
-        shm_unlink(name);
     }
     if (ftruncate(fd, size) < 0)
         Utils::die("%s: ftruncate: %s\n", NAME, strerror(errno));
@@ -280,28 +299,54 @@ void WlBackend::Impl::render_and_commit(WlOutput* out, int steps) {
     uint32_t* px = (uint32_t*)((char*)out->shm_data +
                                (size_t)bi * out->buf_w * 4 * out->buf_h);
 
+    RenderTarget& tgt = out->targets[bi];
     if (this->render_ready) {
         if (!out->rain_ready) {
             out->rain.configure(this->renderer.rain_params(), (uint32_t)rand());
             out->rain_ready = true;
         }
         /* keep the simulation's metrics in step with the atlas at this scale
-         * (droplet deactivation uses char_height) */
-        out->rain.metrics = this->renderer.atlas_for(sc).metrics;
-        out->last_scale = sc;
+         * (droplet deactivation uses char_height); apply_config resets
+         * last_scale so a hot reload refreshes them too */
+        if (out->last_scale != sc) {
+            out->rain.metrics = this->renderer.atlas_for(sc).metrics;
+            out->last_scale = sc;
+        }
         for (int s = 0; s < steps; s++)
             out->rain.step(out->buf_w, out->buf_h, this->mutate_chars);
         int state = this->auth ? this->auth->state() : States::INIT;
-        this->renderer.draw(out->rain, px, out->buf_w, out->buf_h, sc, state);
+        this->renderer.draw(out->rain, px, out->buf_w, out->buf_h, sc, state,
+                            tgt, this->damage);
     } else {
         std::fill_n(px, (size_t)out->buf_w * out->buf_h,
                     this->renderer.background());
+        tgt.invalidate();
+        tgt.content.clear();
+        this->damage.assign(1, {0, 0, out->buf_w, out->buf_h});
     }
 
     if (this->compositor_version >= 3)
         wl_surface_set_buffer_scale(out->surface, sc);
     wl_surface_attach(out->surface, out->buffers[bi], 0, 0);
-    wl_surface_damage_buffer(out->surface, 0, 0, out->buf_w, out->buf_h);
+
+    /* The compositor shows the last committed frame (usually the other
+     * buffer), so the commit damage is that frame's ink plus this one's,
+     * not the erased-in-this-buffer set the renderer reports. A full clear
+     * (or an excessive rect count) damages the whole buffer instead. */
+    bool full = !this->damage.empty() && this->damage[0].x == 0 &&
+                this->damage[0].y == 0 && this->damage[0].w == out->buf_w &&
+                this->damage[0].h == out->buf_h;
+    size_t nrects = out->last_commit.size() + tgt.content.size();
+    if (full || nrects > 256) {
+        wl_surface_damage_buffer(out->surface, 0, 0, out->buf_w, out->buf_h);
+    } else {
+        for (const DirtyRect& r : out->last_commit)
+            wl_surface_damage_buffer(out->surface, r.x, r.y, r.w, r.h);
+        for (const DirtyRect& r : tgt.content)
+            wl_surface_damage_buffer(out->surface, r.x, r.y, r.w, r.h);
+    }
+    out->last_commit = tgt.content;
+
     out->busy[bi] = true;
     wl_surface_commit(out->surface);
 }
@@ -338,11 +383,20 @@ void WlBackend::Impl::apply_config() {
     this->renderer.configure(c);
 
     if (structural) {
-        /* restart the simulations with the new structural parameters */
+        /* Restart the simulations with the new structural parameters, as the
+         * renderer applied them: a droplet's characters are indices into the
+         * charset the renderer resolved fonts for, so if it kept the old
+         * charset (a font lookup that failed), the simulations must too. */
         for (auto& out : this->outputs)
             if (out->rain_ready)
-                out->rain.configure(np, (uint32_t)rand());
+                out->rain.configure(this->renderer.rain_params(),
+                                    (uint32_t)rand());
     }
+
+    /* the atlas may have been rebuilt at the same scale (font or size
+     * change): have every output refresh its rain metrics next frame */
+    for (auto& out : this->outputs)
+        out->last_scale = -1;
 
     if (fps_changed && this->render_ready && !this->paused)
         this->arm_anim();
@@ -425,6 +479,9 @@ void WlBackend::Impl::handle_key_press(uint32_t key, bool from_repeat) {
     char buf[32];
     explicit_bzero(&buf, sizeof(buf));
     int len = xkb_state_key_get_utf8(this->xkb, kc, buf, sizeof(buf));
+    /* get_utf8 returns the untruncated length; clamp to what buf holds */
+    if (len >= (int)sizeof(buf))
+        len = (int)sizeof(buf) - 1;
 
     /* keypad remapping, as the X11 backend does */
     if (sym == XKB_KEY_KP_Enter) {

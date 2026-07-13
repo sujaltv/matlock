@@ -2,7 +2,7 @@
 # See LICENCE file for copyright and licence details.
 
 # matlock version and binary name
-VERSION = 1.3.1
+VERSION = 1.3.2
 RELEASE = 0
 ARCH=x86_64
 BIN_FILE = matlock

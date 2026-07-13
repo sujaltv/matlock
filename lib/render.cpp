@@ -45,12 +45,25 @@ void build_lut(std::array<uint32_t, 256>& lut, uint32_t bg, uint32_t fg) {
     }
 }
 
+void rect_union(DirtyRect& a, int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0)
+        return;
+    if (a.w <= 0) {
+        a = {x, y, w, h};
+        return;
+    }
+    int x1 = std::min(a.x, x), y1 = std::min(a.y, y);
+    int x2 = std::max(a.x + a.w, x + w), y2 = std::max(a.y + a.h, y + h);
+    a = {x1, y1, x2 - x1, y2 - y1};
+}
+
 void blit_glyph(uint32_t* px, int bw, int bh, const RainGlyph& g,
-                int ox, int oy, const uint32_t* lut) {
+                int ox, int oy, const uint32_t* lut, DirtyRect& ink) {
     /* (ox, oy) is the baseline origin, as with XDrawString. Clipping is
      * hoisted out of the pixel loop: the visible glyph rectangle is computed
      * once, then the inner loops run unclipped with a single well-predicted
-     * coverage branch, no arithmetic and no divides. */
+     * coverage branch, no arithmetic and no divides. The clipped rectangle
+     * is accumulated into `ink` for the dirty-region tracking. */
     int x0 = ox + g.left;
     int y0 = oy - g.top;
 
@@ -63,6 +76,8 @@ void blit_glyph(uint32_t* px, int bw, int bh, const RainGlyph& g,
     if (rs >= re || cs >= ce)
         return;
 
+    rect_union(ink, x0 + cs, y0 + rs, ce - cs, re - rs);
+
     for (int row = rs; row < re; row++) {
         const uint8_t* src = &g.cov[(size_t)row * g.w];
         uint32_t* dst = px + (size_t)(y0 + row) * bw + x0;
@@ -74,27 +89,43 @@ void blit_glyph(uint32_t* px, int bw, int bh, const RainGlyph& g,
     }
 }
 
+/* how many faces (the primary plus fallbacks) one charset may draw from */
+constexpr size_t MAX_FACES = 8;
+
 } // namespace
 
 
 Renderer::~Renderer() {
-    if (this->face_)
-        FT_Done_Face(this->face_);
+    for (FT_Face f : this->faces_)
+        FT_Done_Face(f);
     if (this->ft_)
         FT_Done_FreeType(this->ft_);
 }
 
 
-bool Renderer::init_fonts(const char* pattern) {
+bool Renderer::resolve_fonts(const char* pattern,
+                             const std::vector<char32_t>& charset) {
     /**
-     * Resolve a fontconfig pattern to a font file and load its face,
-     * replacing the current one. fontconfig is initialised for the lookup
-     * and torn down again afterwards (FreeType reads the file itself and
-     * needs no fontconfig), keeping no fontconfig caches resident.
+     * Match `pattern` to a primary face, then cover whatever it is missing.
+     * A pattern like "monospace" resolves to a face that, in practice, holds
+     * Latin and little else, so any charset outside that range needs help: the
+     * codepoints the primary face lacks are handed back to fontconfig as a
+     * charset requirement, and the sorted matches are walked until every
+     * character has a face that can draw it. Characters no font on the system
+     * can draw are reported and left blank.
+     *
+     * fontconfig is initialised for the lookup and torn down again afterwards
+     * (FreeType reads the files itself and needs no fontconfig), keeping no
+     * fontconfig caches resident.
      */
 
     if (!FcInit()) {
         fprintf(stderr, "%s: fontconfig init failed\n", NAME);
+        return false;
+    }
+    if (!this->ft_ && FT_Init_FreeType(&this->ft_)) {
+        fprintf(stderr, "%s: FT_Init_FreeType failed\n", NAME);
+        FcFini();
         return false;
     }
 
@@ -122,26 +153,105 @@ bool Renderer::init_fonts(const char* pattern) {
         FcFini();
         return false;
     }
-
-    if (!this->ft_ && FT_Init_FreeType(&this->ft_)) {
-        fprintf(stderr, "%s: FT_Init_FreeType failed\n", NAME);
-        FcPatternDestroy(match);
-        FcFini();
-        return false;
-    }
-    FT_Face nface = nullptr;
-    if (FT_New_Face(this->ft_, (const char*)file, 0, &nface)) {
+    FT_Face primary = nullptr;
+    if (FT_New_Face(this->ft_, (const char*)file, 0, &primary)) {
         fprintf(stderr, "%s: FT_New_Face %s failed\n", NAME, (const char*)file);
         FcPatternDestroy(match);
         FcFini();
         return false;
     }
     FcPatternDestroy(match);
+
+    /* from here on nothing can fail: the primary face is loaded, so the new
+     * face set will replace the old one whatever the fallback search finds */
+    std::vector<FT_Face> faces{primary};
+    std::vector<int> map(charset.size(), -1);
+    size_t missing = 0;
+    for (size_t i = 0; i < charset.size(); i++) {
+        if (FT_Get_Char_Index(primary, (FT_ULong)charset[i]))
+            map[i] = 0;
+        else
+            missing++;
+    }
+
+    if (missing) {
+        FcCharSet* want = FcCharSetCreate();
+        for (size_t i = 0; i < charset.size(); i++)
+            if (map[i] < 0)
+                FcCharSetAddChar(want, (FcChar32)charset[i]);
+
+        FcPattern* fpat = FcNameParse((const FcChar8*)pattern);
+        if (fpat) {
+            /* keep the user's pattern (weight, spacing, style) and add the
+             * uncovered characters as a requirement, so the sort prefers a
+             * font that both matches the look and can draw them */
+            FcPatternAddCharSet(fpat, FC_CHARSET, want);
+            FcConfigSubstitute(NULL, fpat, FcMatchPattern);
+            FcDefaultSubstitute(fpat);
+            FcResult fres;
+            FcFontSet* fs = FcFontSort(NULL, fpat, FcTrue, NULL, &fres);
+            FcPatternDestroy(fpat);
+
+            if (fs) {
+                for (int f = 0; f < fs->nfont && missing &&
+                                faces.size() < MAX_FACES; f++) {
+                    FcChar8* ffile = NULL;
+                    if (FcPatternGetString(fs->fonts[f], FC_FILE, 0, &ffile)
+                        != FcResultMatch)
+                        continue;
+
+                    /* fontconfig's cached charset answers coverage without
+                     * touching the font file; only load faces that help */
+                    FcCharSet* have = NULL;
+                    bool cached = FcPatternGetCharSet(fs->fonts[f], FC_CHARSET,
+                                                      0, &have) == FcResultMatch;
+                    if (cached) {
+                        bool useful = false;
+                        for (size_t i = 0; i < charset.size() && !useful; i++)
+                            if (map[i] < 0 &&
+                                FcCharSetHasChar(have, (FcChar32)charset[i]))
+                                useful = true;
+                        if (!useful)
+                            continue;
+                    }
+
+                    FT_Face fb = nullptr;
+                    if (FT_New_Face(this->ft_, (const char*)ffile, 0, &fb))
+                        continue;
+
+                    int fi = (int)faces.size();
+                    bool used = false;
+                    for (size_t i = 0; i < charset.size(); i++) {
+                        if (map[i] >= 0)
+                            continue;
+                        if (!FT_Get_Char_Index(fb, (FT_ULong)charset[i]))
+                            continue;
+                        map[i] = fi;
+                        missing--;
+                        used = true;
+                    }
+                    if (used)
+                        faces.push_back(fb);
+                    else
+                        FT_Done_Face(fb);
+                }
+                FcFontSetDestroy(fs);
+            }
+        }
+        FcCharSetDestroy(want);
+    }
+
     FcFini();
 
-    if (this->face_)
-        FT_Done_Face(this->face_);
-    this->face_ = nface;
+    if (missing)
+        fprintf(stderr, "%s: no font on this system draws %zu of the %zu "
+                "charset characters; they will fall blank\n", NAME, missing,
+                charset.size());
+
+    for (FT_Face f : this->faces_)
+        FT_Done_Face(f);
+    this->faces_ = faces;
+    this->charset_face_ = map;
     return true;
 }
 
@@ -166,20 +276,28 @@ void Renderer::configure(const Config& cfg) {
     bool rebuild = false;
 
     RainParams np = ::rain_params(cfg);
+
+    /* The faces are resolved for a specific charset, so a new charset needs a
+     * new lookup just as a new pattern does. If the lookup fails the old faces
+     * stay, and so must the charset they cover: the two are one unit, and the
+     * atlas is indexed by charset position. */
+    if (cfg.font_pattern != this->applied_pattern_ || this->faces_.empty() ||
+        np.charset != this->applied_rain_.charset) {
+        if (this->resolve_fonts(cfg.font_pattern.c_str(), np.charset)) {
+            this->applied_pattern_ = cfg.font_pattern;
+            rebuild = true;
+        } else {
+            fprintf(stderr, "%s: keeping font '%s' and its charset\n", NAME,
+                    this->applied_pattern_.c_str());
+            np.charset = this->applied_rain_.charset;
+        }
+    }
+
     if (!(np == this->applied_rain_)) {
         this->applied_rain_ = np;
         rebuild = true;
     }
 
-    if (cfg.font_pattern != this->applied_pattern_ || !this->face_) {
-        if (this->init_fonts(cfg.font_pattern.c_str())) {
-            this->applied_pattern_ = cfg.font_pattern;
-            rebuild = true;
-        } else if (this->face_) {
-            fprintf(stderr, "%s: keeping font '%s'\n", NAME,
-                    this->applied_pattern_.c_str());
-        }
-    }
     if (cfg.font_size != this->applied_size_) {
         this->applied_size_ = cfg.font_size;
         rebuild = true;
@@ -193,6 +311,9 @@ void Renderer::configure(const Config& cfg) {
                                              this->applied_rain_.depth_levels);
         this->atlases_.clear();
     }
+
+    /* colours or worse may have changed: every target needs a full repaint */
+    this->gen_++;
 }
 
 
@@ -202,35 +323,57 @@ const Atlas& Renderer::atlas_for(int scale) {
         return it->second;
 
     int n = this->applied_rain_.depth_levels;
+    const std::vector<char32_t>& cs = this->applied_rain_.charset;
+
     Atlas& atlas = this->atlases_[scale];
     atlas.metrics.resize(n);
-    atlas.glyphs.resize(n);
+    atlas.glyphs.assign(n, std::vector<RainGlyph>(cs.size()));
+
     for (int d = 0; d < n; d++) {
-        if (FT_Set_Pixel_Sizes(this->face_, 0, this->font_sizes_[d] * scale))
-            Utils::die("%s: FT_Set_Pixel_Sizes failed\n", NAME);
+        for (FT_Face f : this->faces_)
+            if (FT_Set_Pixel_Sizes(f, 0, this->font_sizes_[d] * scale))
+                Utils::die("%s: FT_Set_Pixel_Sizes failed\n", NAME);
 
-        /* the face is monospaced: use a reference glyph for the advance */
-        if (FT_Load_Char(this->face_, 'M', FT_LOAD_RENDER))
-            Utils::die("%s: FT_Load_Char failed\n", NAME);
-        atlas.metrics[d].char_width = (int)(this->face_->glyph->advance.x >> 6);
-        atlas.metrics[d].char_height =
-            (int)((this->face_->size->metrics.ascender -
-                   this->face_->size->metrics.descender) >> 6);
+        /* The cell is the tallest line box and the widest advance over the
+         * faces and characters actually in use, rather than the advance of one
+         * reference glyph: a charset can span several faces now, and need not
+         * contain any given Latin letter. For a monospaced face and an ASCII
+         * charset this is the advance of every glyph in it, as before. */
+        int cw = 0, ch = 0;
+        for (FT_Face f : this->faces_) {
+            int lh = (int)((f->size->metrics.ascender -
+                            f->size->metrics.descender) >> 6);
+            if (lh > ch)
+                ch = lh;
+        }
 
-        for (unsigned char ch : this->applied_rain_.charset) {
-            if (FT_Load_Char(this->face_, ch, FT_LOAD_RENDER))
+        for (size_t i = 0; i < cs.size(); i++) {
+            int fi = this->charset_face_[i];
+            if (fi < 0)                         // no face draws this character
                 continue;
-            const FT_Bitmap& bm = this->face_->glyph->bitmap;
-            RainGlyph& g = atlas.glyphs[d][ch & 0x7F];
+            FT_Face f = this->faces_[fi];
+            if (FT_Load_Char(f, (FT_ULong)cs[i], FT_LOAD_RENDER))
+                continue;
+
+            int adv = (int)(f->glyph->advance.x >> 6);
+            if (adv > cw)
+                cw = adv;
+
+            const FT_Bitmap& bm = f->glyph->bitmap;
+            RainGlyph& g = atlas.glyphs[d][i];
             g.w = (int)bm.width;
             g.h = (int)bm.rows;
-            g.left = this->face_->glyph->bitmap_left;
-            g.top = this->face_->glyph->bitmap_top;
+            g.left = f->glyph->bitmap_left;
+            g.top = f->glyph->bitmap_top;
             g.cov.resize((size_t)g.w * g.h);
             for (int row = 0; row < g.h; row++)
                 memcpy(&g.cov[(size_t)row * g.w],
                        bm.buffer + (size_t)row * bm.pitch, g.w);
         }
+
+        /* a droplet's spacing divides by these, so never leave them at zero */
+        atlas.metrics[d].char_width = cw > 0 ? cw : 1;
+        atlas.metrics[d].char_height = ch > 0 ? ch : 1;
     }
     return atlas;
 }
@@ -247,44 +390,109 @@ void Renderer::evict_atlases(const std::vector<int>& keep) {
 
 
 void Renderer::draw(const Rain& rain, uint32_t* px, int w, int h,
-                    int scale, int state) {
+                    int scale, int state, RenderTarget& tgt,
+                    std::vector<DirtyRect>& damage) {
     /**
-     * Clear to the background, then draw a body pass and a head pass per
-     * depth (near depths last so they overlay far ones), matching the layer
-     * ordering both backends used before unification.
+     * Erase the previous frame's ink (or clear fully when the target is
+     * invalid), then draw a body pass and a head pass per depth (near depths
+     * last so they overlay far ones), matching the layer ordering both
+     * backends used before unification. Each active droplet's clipped ink is
+     * recorded in the target, so the next frame erases and the presentation
+     * path transfers only what actually changed.
      */
 
     const Atlas& atlas = this->atlas_for(scale);
-    std::fill_n(px, (size_t)w * h, this->background_);
+    damage.clear();
 
-    for (int d = 0; d < rain.p.depth_levels; d++) {
+    if (tgt.gen != this->gen_ || tgt.w != w || tgt.h != h) {
+        std::fill_n(px, (size_t)w * h, this->background_);
+        tgt.gen = this->gen_;
+        tgt.w = w;
+        tgt.h = h;
+        damage.push_back({0, 0, w, h});
+    } else {
+        /* The previous ink must become background again, but the damage
+         * reported stays the ink rects either way: a full clear rewrites the
+         * other pixels with the value they already have. Erasing rect by
+         * rect writes narrow column strips, which is several times slower
+         * per pixel than one streaming clear, so it only pays off when the
+         * ink covers little of the frame. */
+        size_t area = 0;
+        for (const DirtyRect& r : tgt.content)
+            area += (size_t)r.w * r.h;
+        if (area * 8 > (size_t)w * h) {
+            std::fill_n(px, (size_t)w * h, this->background_);
+        } else {
+            for (const DirtyRect& r : tgt.content)
+                for (int row = 0; row < r.h; row++)
+                    std::fill_n(px + (size_t)(r.y + row) * w + r.x,
+                                (size_t)r.w, this->background_);
+        }
+        for (const DirtyRect& r : tgt.content)
+            damage.push_back(r);
+    }
+    tgt.content.clear();
+
+    /* bucket the active droplets by depth (counting sort), so each depth
+     * pass walks only its own droplets */
+    int nd = rain.p.depth_levels;
+    this->bucket_start_.assign(nd + 1, 0);
+    for (int ai = 0; ai < rain.active_count; ai++)
+        this->bucket_start_[rain.droplets[rain.active_list[ai]].depth + 1]++;
+    for (int d = 0; d < nd; d++)
+        this->bucket_start_[d + 1] += this->bucket_start_[d];
+    this->order_.resize(rain.active_count);
+    this->bucket_pos_.assign(this->bucket_start_.begin(),
+                             this->bucket_start_.end() - 1);
+    for (int ai = 0; ai < rain.active_count; ai++)
+        this->order_[this->bucket_pos_[rain.droplets[rain.active_list[ai]]
+                                           .depth]++] = ai;
+
+    this->drop_rects_.assign(rain.active_count, DirtyRect{});
+
+    for (int d = 0; d < nd; d++) {
         int dch = atlas.metrics[d].char_height;
 
         const uint32_t* body = this->body_lut_[state][d].data();
-        for (int ai = 0; ai < rain.active_count; ai++) {
+        for (int k = this->bucket_start_[d]; k < this->bucket_start_[d + 1]; k++) {
+            int ai = this->order_[k];
             int i = rain.active_list[ai];
             const Droplet& drop = rain.droplets[i];
-            if (drop.depth != d) continue;
-            const char* dc = rain.droplet_chars(i);
-            for (int j = 1; j < drop.length; j++) {
-                int y = drop.y - (j * dch);
-                if (y < 0 || y > h) continue;
-                blit_glyph(px, w, h,
-                           atlas.glyphs[d][(unsigned char)dc[j] & 0x7F],
-                           drop.x, y, body);
-            }
+            const uint16_t* dc = rain.droplet_chars(i);
+            /* only the characters whose baseline can put ink on screen:
+             * y = drop.y - j*dch within (-dch, h + dch); the blit clips the
+             * exact extents */
+            int j0 = 1, j1 = drop.length - 1;
+            int over = drop.y - h - dch;
+            if (over > 0)
+                j0 = (over + dch - 1) / dch;
+            if (j0 < 1)
+                j0 = 1;
+            int jv = (drop.y + dch) / dch;
+            if (jv < j1)
+                j1 = jv;
+            DirtyRect& ink = this->drop_rects_[ai];
+            for (int j = j0; j <= j1; j++)
+                blit_glyph(px, w, h, atlas.glyphs[d][dc[j]], drop.x,
+                           drop.y - j * dch, body, ink);
         }
 
         const uint32_t* head = this->head_lut_[state][d].data();
-        for (int ai = 0; ai < rain.active_count; ai++) {
+        for (int k = this->bucket_start_[d]; k < this->bucket_start_[d + 1]; k++) {
+            int ai = this->order_[k];
             int i = rain.active_list[ai];
             const Droplet& drop = rain.droplets[i];
-            if (drop.depth != d) continue;
-            if (drop.y >= 0 && drop.y <= h) {
+            if (drop.y > -dch && drop.y < h + dch)
                 blit_glyph(px, w, h,
-                           atlas.glyphs[d][(unsigned char)rain.droplet_chars(i)[0] & 0x7F],
-                           drop.x, drop.y, head);
-            }
+                           atlas.glyphs[d][rain.droplet_chars(i)[0]],
+                           drop.x, drop.y, head, this->drop_rects_[ai]);
+        }
+    }
+
+    for (const DirtyRect& r : this->drop_rects_) {
+        if (r.w > 0) {
+            tgt.content.push_back(r);
+            damage.push_back(r);
         }
     }
 }

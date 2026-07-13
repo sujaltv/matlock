@@ -35,7 +35,7 @@ spawn_attempts: 1
 # on-screen speed, density and mutation rate are the same at any value;
 # lower means less CPU with coarser motion. On HiDPI Wayland outputs,
 # "hidpi: false" below cuts CPU far more than lowering this.
-fps: 20
+fps: 30
 
 # freeze the animation after this many seconds without input (0..86400,
 # 0 disables, the default); when set, the process sleeps at ~0% CPU until a
@@ -47,9 +47,11 @@ idle_timeout: 0
 # Retina-class outputs, at some crispness cost; Wayland only)
 hidpi: true
 
-# characters the streams are made of (printable ASCII, no spaces; written
-# unquoted because the set contains both quote characters)
-charset: ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789~`!@#$%^&*()_+-=[]{}\;:'",<.>/?
+# characters the streams are made of (1..1024 UTF-8 characters, no spaces;
+# written unquoted because the set contains both quote characters). Any script
+# works: characters the font_pattern font lacks are drawn from a fallback font
+# that has them. Use base letters only, as combining marks cannot stand alone.
+charset: 日ﾊﾐﾋｰｳｼﾅﾓﾆｻﾜﾂｵﾘｱﾎﾃﾏｹﾒｴｶｷﾑﾕﾗｾﾈｽﾀﾇﾍｦｲｸｺｿﾁﾄﾉﾌﾔﾖﾙﾚﾛﾝ012345789THEMATRIX:・."=*+-<>¦｜ﾘ
 
 # characters in the falling columns mutate as they fall
 mutate_chars: true
