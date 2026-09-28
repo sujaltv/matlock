@@ -122,8 +122,8 @@ sudo make uninstall
 
 By default,
 
-* the build files are created in `$TMPDIR/matlock` and can be changed by setting
-  the variable `BUILD_DIR`;
+* the build files are created in `build/` inside the source tree and can be
+  changed by setting the variable `BUILD_DIR`;
 * the installation directory is `PREFIX` (likely `/usr/`);
     * the binary file will be located in `PREFIX/bin`;
     * the user manual will be located in `PREFIX/share/man/man1`; and

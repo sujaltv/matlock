@@ -2,13 +2,14 @@
 # See LICENCE file for copyright and licence details.
 
 # matlock version and binary name
-VERSION = 1.3.3
+VERSION = 1.3.4
 RELEASE = 0
 ARCH=x86_64
 BIN_FILE = matlock
 
 # build and installation directories (absolute paths)
-BUILD_DIR = $(TMPDIR)/$(BIN_FILE)
+TMPDIR ?= /tmp
+BUILD_DIR = $(CURDIR)/build
 __RELEASE_FILE = $(BIN_FILE)-v$(VERSION)-$(RELEASE)-$(ARCH)
 __RELEASE_DIR = $(TMPDIR)/$(__RELEASE_FILE)
 PREFIX = /usr
